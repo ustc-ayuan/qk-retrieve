@@ -1,0 +1,8 @@
+__pycache__/*
+locomo-main/*
+mem0-main/*
+output/*
+plot/*
+locomo10.json
+*.log
+
