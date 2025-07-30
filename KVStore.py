@@ -43,6 +43,9 @@ class KVCacheManager:
         self.hash_key_list: List[str] = []
         self.kv_cache: Dict[str, DynamicCache] = {}
         self.memory_digest_cache: Dict[str, List[Digest]] = {}
+        self.retrieve_cnt = -1
+        self.score_dir = "detailed_related_score/block_size_16/pts"
+        os.makedirs(self.score_dir, exist_ok=True)
         #self.top_indices_log_file = "top_indices.log"
         # Clear the log file at initialization
         #with open(self.top_indices_log_file, "w") as f:
@@ -104,6 +107,9 @@ class KVCacheManager:
                             query_vector: torch.Tensor,
                             topk: int = 5,
                             layer_idx: int = 0) -> List[Tuple[int, Cache, str]]:
+        if layer_idx == 0:
+            self.retrieve_cnt += 1
+
         if len(self.hash_key_list) == 0:
             return []
         
@@ -116,7 +122,7 @@ class KVCacheManager:
                 min_digest_list.append(self.memory_digest_cache[key][layer_idx][1])
         max_digest = torch.stack(max_digest_list, dim=2).to(query_vector.device)
         min_digest = torch.stack(min_digest_list, dim=2).to(query_vector.device)
-        scores = self.related_score_eval(query_vector,max_digest,min_digest)
+        scores = self.related_score_eval(query_vector, max_digest, min_digest, layer_idx)
         topk = min(topk, len(scores[0]))
         top_values, top_indices = torch.topk(torch.tensor(scores[0]), k=topk, largest=True, sorted=True)
         #with open(self.top_indices_log_file, "a") as f:
@@ -142,7 +148,7 @@ class KVCacheManager:
         #&"""
         return results
         
-    def related_score_eval(self, query: torch.Tensor, max_digest: torch.Tensor, min_digest: torch.Tensor) -> List[float]:
+    def related_score_eval(self, query: torch.Tensor, max_digest: torch.Tensor, min_digest: torch.Tensor, layer_idx: int) -> List[float]:
         batch, q_num_key_value_heads, qlen, head_dim = query.shape
         batch, k_num_key_value_heads, klen, head_dim = max_digest.shape
         # GQA 适配
@@ -159,7 +165,14 @@ class KVCacheManager:
         qmax = query_expand * max_digest_expand
         qmin = query_expand * min_digest_expand  # (bsz, head_num, q_len, k_len, head_dim)
 
-        scores = torch.max(qmax, qmin).sum(dim=-1).sum(dim=1)  # (bsz, q_len, k_len)
+        detailed_scores = torch.max(qmax, qmin).sum(dim=-1) # (bsz, head_num, q_len, k_len)
+        
+        # 保存所有层的详细分数
+        scores_to_save = detailed_scores.cpu()
+        save_path = os.path.join(self.score_dir, f"cnt_{self.retrieve_cnt}_layer_{layer_idx}_related_score.pt")
+        torch.save(scores_to_save, save_path)
+
+        scores = detailed_scores.sum(dim=1)  # (bsz, q_len, k_len)
     
         # 检查是否有 inf 或 NaN
         if torch.isinf(scores).any() or torch.isnan(scores).any():

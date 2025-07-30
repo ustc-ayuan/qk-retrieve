@@ -10,12 +10,16 @@ def main():
     parser.add_argument("--block_size", type=int, required=True, help="Block size for the model.")
     parser.add_argument("--topk", type=int, required=True, help="Top-k value for the model.")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save the results.")
+    parser.add_argument("--session_cnt", type=int, default=13, help="Number of history prompt sessions.")
+    parser.add_argument("--qa_cnt", type=int, default=150, help="Number of QA rounds.")
     args = parser.parse_args()
 
     model_path = args.model_path
     block_size = args.block_size
     topk = args.topk
     output_path = args.output_path
+    session_cnt = args.session_cnt
+    qa_cnt = args.qa_cnt
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = LlamaForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, block_size=block_size, topk=topk).cuda()
@@ -64,7 +68,7 @@ def main():
     cnt = 0
     for session in sessions:
         cnt = cnt + 1
-        if cnt > 13:
+        if cnt > session_cnt:
             break
         full_history_prompt = full_history_prompt + "\nTimestamp: " + session['timestamp'] + "\nConversation: " + session['conversation']
 
@@ -75,7 +79,7 @@ def main():
         question = qa["question"]
         standard_answer = qa["answer"]  # 假设每个问题都有一个标准答案
         cnt = cnt + 1
-        if cnt > 150:
+        if cnt > qa_cnt:
             break
         if cnt == 1:
             prompt = full_history_prompt + "\nQuestion: " + question + "\nAnswer: "
