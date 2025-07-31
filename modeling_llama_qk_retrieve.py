@@ -360,27 +360,9 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         if(q_len > 1):
-            retrieve_res = self.kv_cache_manager.retrieve_related_kv(query_states,self.topk,self.layer_idx)
-            retrieve_block_cnt = len(retrieve_res)
-            if retrieve_block_cnt > 0:
-                k_list = []
-                v_list = []
-                for res in retrieve_res:
-                    k_list.append(res[1].key_cache[self.layer_idx])
-                    v_list.append(res[1].value_cache[self.layer_idx])
-                retrieve_k = torch.cat([k for k in k_list], dim=-2).cuda()
-                retrieve_v = torch.cat([v for v in v_list], dim=-2).cuda()
-                # append past_key_values to retrieve_kvcache
-                #print("@ retrieve from disk")
-                #print("retrieve_k.shape " + str(retrieve_k.shape))
-                #key_states = key_states[:,:,21:,:]
-                #value_states = value_states[:,:,21:,:]
-                #print("@ cutdown keystate")
-                #print("key_state.shape " + str(key_states.shape))
-                #print("@ concat keystate")
-                #key_states = torch.cat((retrieve_k,key_states),dim=-2)
-                #value_states = torch.cat((retrieve_v,value_states),dim=-2)
-                #print("key_state.shape after concat " + str(key_states.shape))
+            retrieve_k, retrieve_v = self.kv_cache_manager.retrieve_related_kv(query_states,self.topk,self.layer_idx,self.num_key_value_groups)
+            retrieve_kv_len = retrieve_k.shape[-2]
+            if retrieve_kv_len > 0:
                 if len(past_key_value.key_cache) <= self.layer_idx:
                     past_key_value.key_cache.append(retrieve_k)
                     past_key_value.value_cache.append(retrieve_v)
@@ -391,6 +373,7 @@ class LlamaAttention(nn.Module):
                     past_key_value._seen_tokens = past_key_value._seen_tokens + retrieve_k.shape[-2]
                 # update position_ids & cache_positions
                 self.history_context_len = self.kv_cache_manager.history_token_cnt
+    
         position_ids = position_ids + self.history_context_len
         position_embeddings = self.rotary_emb(hidden_states, position_ids)  
         
