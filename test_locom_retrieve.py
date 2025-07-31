@@ -8,7 +8,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run LlamaForCausalLM with different parameters.")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model.")
     parser.add_argument("--block_size", type=int, required=True, help="Block size for the model.")
-    parser.add_argument("--topk", type=int, required=True, help="Top-k value for the model.")
+    parser.add_argument("--topk_threshold", type=float, required=True, help="Top-k threshold for the model.")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save the results.")
     parser.add_argument("--session_cnt", type=int, default=13, help="Number of history prompt sessions.")
     parser.add_argument("--qa_cnt", type=int, default=150, help="Number of QA rounds.")
@@ -16,13 +16,13 @@ def main():
 
     model_path = args.model_path
     block_size = args.block_size
-    topk = args.topk
+    topk_threshold = args.topk_threshold
     output_path = args.output_path
     session_cnt = args.session_cnt
     qa_cnt = args.qa_cnt
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = LlamaForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, block_size=block_size, topk=topk).cuda()
+    model = LlamaForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, block_size=block_size, topk_threshold=topk_threshold).cuda()
     model.eval()
 
     data_path = "./locomo10.json"

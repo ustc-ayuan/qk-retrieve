@@ -94,14 +94,14 @@ def main():
         print(f"Judged results saved to {judged_file_path}")
     else:
         # Process all files in the folder
-        pattern = re.compile(r"output_block_(\d+)_topk_(\d+).txt")
+        pattern = re.compile(r"output_block_(\d+)_topk_(\d+(\.\d+)?)\.txt")
         accuracies = {}
 
         for file_name in tqdm(os.listdir(input_path)):
             match = pattern.match(file_name)
             if match:
                 block_size = int(match.group(1))
-                topk = int(match.group(2))
+                topk = float(match.group(2))
                 file_path = os.path.join(input_path, file_name)
 
                 average_f1, _ = process_file(file_path)

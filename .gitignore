@@ -8,3 +8,4 @@ locomo10.json
 *.txt
 simple_test/*
 *related_score/*
+logs/*

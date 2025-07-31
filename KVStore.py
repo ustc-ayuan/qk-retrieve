@@ -32,11 +32,13 @@ class KVCacheManager:
     def __init__(self, 
                  memory_capacity: int = 2000, 
                  hbm_capacity = 20,
-                 disk_path: Optional[str] = "/mnt/sda1/homie_cache/"):
+                 disk_path: Optional[str] = "/mnt/sda1/homie_cache/",
+                 block_size: int = 64,
+                 topk_threshold: float = 0.9):
         self.disk_path = disk_path
         self.hbm_capacity = hbm_capacity
         self.memory_capacity = memory_capacity
-        self.tokenizer = AutoTokenizer.from_pretrained("/mnt/sda1/Meta-Llama-3-8B-Instruct")
+        self.tokenizer = AutoTokenizer.from_pretrained("/mnt/sda1/Llama-3.1-8B")
         
         self.history_token_cnt = 0
         self.input_ids_list: List[List[int]] = []
@@ -44,12 +46,23 @@ class KVCacheManager:
         self.kv_cache: Dict[str, DynamicCache] = {}
         self.memory_digest_cache: Dict[str, List[Digest]] = {}
         self.retrieve_cnt = -1
-        self.score_dir = "detailed_related_score/block_size_16/pts"
-        os.makedirs(self.score_dir, exist_ok=True)
-        #self.top_indices_log_file = "top_indices.log"
-        # Clear the log file at initialization
-        #with open(self.top_indices_log_file, "w") as f:
-        #    pass
+        
+        # Logging setup
+        self.log_dir = f"logs/block_size_{block_size}_threshold_{topk_threshold}"
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.topk_log_file = os.path.join(self.log_dir, "dynamic_topk.log")
+        self.time_log_file = os.path.join(self.log_dir, "timing.log")
+
+        # Clear log files at initialization
+        with open(self.topk_log_file, "w") as f:
+            f.write("request_id,layer_idx,max_k\n")
+        with open(self.time_log_file, "w") as f:
+            f.write("request_id,total_forward_time,total_topk_time,total_concat_time,total_attn_time,other_time\n")
+
+        # Time accumulators for the current request
+        self.current_topk_time = 0
+        self.current_concat_time = 0
+        self.current_attn_time = 0
         
     def _generate_key(self, token_ids: List[int]) -> str:
         return hashlib.sha256(str(token_ids).encode()).hexdigest()
@@ -101,19 +114,36 @@ class KVCacheManager:
             digest.append((maxs, mins))
 
         self.memory_digest_cache[key] = digest
-        
 
+    def log_time(self, event_type: str, duration: float):
+        if event_type == "topk_time":
+            self.current_topk_time += duration
+        elif event_type == "concat_time":
+            self.current_concat_time += duration
+        elif event_type == "attn_time":
+            self.current_attn_time += duration
+
+    def finalize_and_log_times(self, total_forward_time: float):
+        other_time = total_forward_time - self.current_topk_time - self.current_concat_time - self.current_attn_time
+        with open(self.time_log_file, "a") as f:
+            f.write(f"{self.retrieve_cnt},{total_forward_time},{self.current_topk_time},{self.current_concat_time},{self.current_attn_time},{other_time}\n")
+        
+        # Reset accumulators
+        self.current_topk_time = 0
+        self.current_concat_time = 0
+        self.current_attn_time = 0
+        
     def retrieve_related_kv(self,
                             query_vector: torch.Tensor,
-                            topk: int = 5,
+                            topk_threshold: float = 0.9,
                             layer_idx: int = 0,
                             num_key_value_groups: int = 8) -> Tuple[torch.Tensor, torch.Tensor]:
         if layer_idx == 0:
             self.retrieve_cnt += 1
 
-        if len(self.hash_key_list) == 0 or topk == 0:
-            return torch.empty(0, 0, 0, 0),torch.empty(0, 0, 0, 0)
-        
+        if len(self.hash_key_list) == 0 or topk_threshold == 0:
+            return torch.empty(0, 0, 0, 0, device=query_vector.device), torch.empty(0, 0, 0, 0, device=query_vector.device)
+
         # TODO: 这里的tensor构建是十分低效的
         max_digest_list = []
         min_digest_list = []
@@ -121,36 +151,69 @@ class KVCacheManager:
             if len(self.memory_digest_cache[key]) > 0:
                 max_digest_list.append(self.memory_digest_cache[key][layer_idx][0])
                 min_digest_list.append(self.memory_digest_cache[key][layer_idx][1])
+        
+        if not max_digest_list:
+            return torch.empty(0, 0, 0, 0, device=query_vector.device), torch.empty(0, 0, 0, 0, device=query_vector.device)
+
         max_digest = torch.stack(max_digest_list, dim=2).to(query_vector.device)
         min_digest = torch.stack(min_digest_list, dim=2).to(query_vector.device)
-        scores = self.related_score_eval(query_vector, max_digest, min_digest, layer_idx, num_key_value_groups)
-        head_num, k_len = scores.shape
-        topk = min(topk, k_len)
-        top_values, top_indices = torch.topk(scores, k=topk, dim=-1, largest=True, sorted=True)
         
+        st = time()
+        scores = self.related_score_eval(query_vector, max_digest, min_digest, layer_idx, num_key_value_groups)
+        
+        head_num, k_len = scores.shape
+        
+        # Sort scores and get original indices
+        sorted_scores, sorted_indices = torch.sort(scores, dim=-1, descending=True)
+        
+        # Calculate cumulative scores
+        cumulative_scores = torch.cumsum(sorted_scores, dim=-1)
+        
+        # Calculate total score for each head
+        total_scores = cumulative_scores[:, -1].unsqueeze(-1)
+        
+        # Determine the number of top-k to select for each head
+        # Find the first index where cumulative score exceeds the threshold
+        k_for_threshold = (cumulative_scores > total_scores * topk_threshold).int().argmax(dim=-1) + 1
+        
+        # Use the maximum k across all heads to ensure uniform k_len
+        max_k = k_for_threshold.max().item()
+        self.log_time("topk_time", time() - st)
+        
+        # Log the dynamic topk value
+        with open(self.topk_log_file, "a") as f:
+            f.write(f"{self.retrieve_cnt},{layer_idx},{max_k}\n")
+        print(f"Request: {self.retrieve_cnt}, Layer: {layer_idx}, Dynamic TopK: {max_k}")
+
+        # Get the top indices based on max_k
+        top_indices = sorted_indices[:, :max_k]
+
+        st = time()
         head_retrieve_k_list = []
         head_retrieve_v_list = []
         for head_idx in range(head_num):
             head_top_indices = top_indices[head_idx]
-            #with open(self.top_indices_log_file, "a") as f:
-            #    f.write(" ".join(map(str, head_top_indices.tolist())) + "\n")
-            sorted_indices = torch.argsort(head_top_indices)
-            results = []
+            
+            # Sort these indices to maintain order for concatenation
+            sorted_head_top_indices = torch.sort(head_top_indices).values
+            
             k_list = []
             v_list = []
-            for sorted_idx in sorted_indices.tolist():
-                idx = head_top_indices[sorted_idx].item()
+            for idx in sorted_head_top_indices.tolist():
                 key = self.hash_key_list[idx]
-                #text = self.tokenizer.decode(self.input_ids_list[idx], skip_special_tokens=True)
-                k_list.append(self.kv_cache[key].key_cache[layer_idx][:,head_idx:head_idx+1,:,:])
-                v_list.append(self.kv_cache[key].value_cache[layer_idx][:,head_idx:head_idx+1,:,:])
-            # concat kvcache for this head
-            head_retrieve_k_list.append(torch.cat([k for k in k_list], dim=-2).cuda())
-            head_retrieve_v_list.append(torch.cat([v for v in v_list], dim=-2).cuda())
-            print("head_retrieve_k_list[0].shape: ",head_retrieve_k_list[0].shape)
-        retrieve_k = torch.cat([k for k in head_retrieve_k_list], dim=1).cuda()
-        retrieve_v = torch.cat([v for v in head_retrieve_v_list], dim=1).cuda()
-        print("retrieve_k.shape: ",retrieve_k.shape)
+                k_list.append(self.kv_cache[key].key_cache[layer_idx][:, head_idx:head_idx+1, :, :])
+                v_list.append(self.kv_cache[key].value_cache[layer_idx][:, head_idx:head_idx+1, :, :])
+            
+            if k_list:
+                head_retrieve_k_list.append(torch.cat(k_list, dim=-2).cuda())
+                head_retrieve_v_list.append(torch.cat(v_list, dim=-2).cuda())
+
+        if not head_retrieve_k_list:
+            return torch.empty(0, 0, 0, 0, device=query_vector.device), torch.empty(0, 0, 0, 0, device=query_vector.device)
+
+        retrieve_k = torch.cat(head_retrieve_k_list, dim=1).cuda()
+        retrieve_v = torch.cat(head_retrieve_v_list, dim=1).cuda()
+        self.log_time("concat_time", time() - st)
         
         return retrieve_k, retrieve_v
         
@@ -176,15 +239,15 @@ class KVCacheManager:
         #detailed_scores = torch.relu(detailed_scores)
         
         # 保存所有层的详细分数
-        scores_to_save = detailed_scores.cpu()
-        save_path = os.path.join(self.score_dir, f"cnt_{self.retrieve_cnt}_layer_{layer_idx}_related_score.pt")
+        #scores_to_save = detailed_scores.cpu()
+        #save_path = os.path.join(self.score_dir, f"cnt_{self.retrieve_cnt}_layer_{layer_idx}_related_score.pt")
         #torch.save(scores_to_save, save_path)
     
         # 检查是否有 inf 或 NaN
         if torch.isinf(detailed_scores).any() or torch.isnan(detailed_scores).any():
             print("scores contains inf or NaN")
             assert 1==2
-        RRF = False
+        RRF = True
         if RRF:
             # 将 scores 转换为排名
             ranks = torch.argsort(detailed_scores, dim=-1, descending=True).argsort(dim=-1) + 1  # (bsz, head_num, q_len, k_len)
