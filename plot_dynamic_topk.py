@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import re
 
 def plot_dynamic_topk_distribution(log_dir='logs'):
     """
@@ -17,6 +18,19 @@ def plot_dynamic_topk_distribution(log_dir='logs'):
     # Find all experiment subdirectories in the log directory
     experiment_dirs = [d for d in os.listdir(log_dir) if os.path.isdir(os.path.join(log_dir, d))]
 
+    # Sort experiment directories by block_size and threshold
+    def sort_key(exp_dir):
+        # Use regular expressions to extract block_size and threshold
+        match = re.search(r'block_size_(\d+)_threshold_(\d+\.\d+)', exp_dir)
+        if match:
+            block_size = int(match.group(1))
+            threshold = float(match.group(2))
+            return (block_size, threshold)
+        else:
+            raise ValueError(f"Directory name '{exp_dir}' does not match expected format 'block_size_<int>_threshold_<float>'")
+
+    experiment_dirs.sort(key=sort_key)
+
     # Prepare a figure to hold all the plots
     num_experiments = len(experiment_dirs)
     if num_experiments == 0:
@@ -24,7 +38,7 @@ def plot_dynamic_topk_distribution(log_dir='logs'):
         return
         
     fig, axes = plt.subplots(num_experiments, 1, figsize=(15, 8 * num_experiments), squeeze=False)
-    fig.suptitle('Distribution of Dynamic Top-K Values Across Layers', fontsize=16)
+    fig.suptitle('Distribution of Dynamic Top-K Values Across Layers', fontsize=20)
 
     # Process each experiment's log file
     for i, exp_dir in enumerate(experiment_dirs):
@@ -40,10 +54,12 @@ def plot_dynamic_topk_distribution(log_dir='logs'):
         # Create a box plot for the current experiment
         ax = axes[i, 0]
         sns.boxplot(x='layer_idx', y='max_k', data=df, ax=ax)
-        ax.set_title(f'Experiment: {exp_dir}')
-        ax.set_xlabel('Layer Index')
-        ax.set_ylabel('Dynamic Top-K (max_k)')
-        ax.tick_params(axis='x', rotation=45)
+        ax.set_title(f'Experiment: {exp_dir}', fontsize=18)
+        ax.set_xlabel('Layer Index', fontsize=18)
+        ax.set_ylabel('Dynamic Top-K (max_k)', fontsize=18)
+        ax.tick_params(axis='x', rotation=45, labelsize=16)
+        ax.tick_params(axis='y', labelsize=16)
+
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     

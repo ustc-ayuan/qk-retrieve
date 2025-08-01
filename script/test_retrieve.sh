@@ -6,7 +6,7 @@ MODEL_PATH="/mnt/sda1/Llama-3.1-8B"
 
 # 定义 block_size 和 topk 的可能值
 BLOCK_SIZES=(8 16)
-TOPK_VALUES=( 0.9)
+TOPK_VALUES=(0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 0.99)
 SESSION_CNT=13
 QA_CNT=150
 
