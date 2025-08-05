@@ -162,13 +162,12 @@ class KVCacheManager:
         scores = self.related_score_eval(query_vector, max_digest, min_digest, layer_idx, num_key_value_groups)
         
         head_num, k_len = scores.shape
-        
+        scores_double = scores.to(torch.float64)
         # Sort scores and get original indices
-        sorted_scores, sorted_indices = torch.sort(scores, dim=-1, descending=True)
+        sorted_scores, sorted_indices = torch.sort(scores_double, dim=-1, descending=True)
         
         # Calculate cumulative scores
         cumulative_scores = torch.cumsum(sorted_scores, dim=-1)
-        
         # Calculate total score for each head
         total_scores = cumulative_scores[:, -1].unsqueeze(-1)
         
@@ -250,12 +249,16 @@ class KVCacheManager:
         RRF = True
         if RRF:
             # 将 scores 转换为排名
+            if layer_idx==0:
+                print("rrf")
             ranks = torch.argsort(detailed_scores, dim=-1, descending=True).argsort(dim=-1) + 1  # (bsz, head_num, q_len, k_len)
             # 应用 RRF 公式
             k = 60  # RRF 参数，通常设置为 60
             rrf_scores = 1 / (k + ranks.float())  # (bsz, head_num, q_len, k_len)
             related_score = rrf_scores.sum(dim=-2)  # (bsz, head_num, k_len)
         else:
+            if layer_idx==0:
+                print("sum")
             related_score = detailed_scores.sum(dim=-2) # (bsz, head_num, k_len)
         
         related_score = related_score.reshape(batch, k_num_key_value_heads, n_rep, klen)

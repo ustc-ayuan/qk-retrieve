@@ -284,13 +284,13 @@ class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None, kv_cache_manager: KVCacheManager = None, 
-                 block_size: int = 64, topk: int = 5):
+                 block_size: int = 64, topk_threshold: float = 0.9):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.kv_cache_manager = kv_cache_manager
         self.block_size = block_size
-        self.topk = topk
+        self.topk_threshold = topk_threshold
         if layer_idx is None:
             logger.warning_once(
                 f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
@@ -360,27 +360,10 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         if(q_len > 1):
-            retrieve_res = self.kv_cache_manager.retrieve_related_kv(query_states,self.topk,self.layer_idx)
-            retrieve_block_cnt = len(retrieve_res)
-            if retrieve_block_cnt > 0:
-                k_list = []
-                v_list = []
-                for res in retrieve_res:
-                    k_list.append(res[1].key_cache[self.layer_idx])
-                    v_list.append(res[1].value_cache[self.layer_idx])
-                retrieve_k = torch.cat([k.clone() for k in k_list], dim=-2).cuda()
-                retrieve_v = torch.cat([v.clone() for v in v_list], dim=-2).cuda()
-                # append past_key_values to retrieve_kvcache
-                #print("@ retrieve from disk")
-                #print("retrieve_k.shape " + str(retrieve_k.shape))
-                #key_states = key_states[:,:,21:,:]
-                #value_states = value_states[:,:,21:,:]
-                #print("@ cutdown keystate")
-                #print("key_state.shape " + str(key_states.shape))
-                #print("@ concat keystate")
-                #key_states = torch.cat((retrieve_k,key_states),dim=-2)
-                #value_states = torch.cat((retrieve_v,value_states),dim=-2)
-                #print("key_state.shape after concat " + str(key_states.shape))
+            st = time()
+            retrieve_k, retrieve_v = self.kv_cache_manager.retrieve_related_kv(query_states,self.topk_threshold,self.layer_idx,self.num_key_value_groups)
+            retrieve_kv_len = retrieve_k.shape[-2]
+            if retrieve_kv_len > 0:
                 if len(past_key_value.key_cache) <= self.layer_idx:
                     past_key_value.key_cache.append(retrieve_k)
                     past_key_value.value_cache.append(retrieve_v)
@@ -391,6 +374,7 @@ class LlamaAttention(nn.Module):
                     past_key_value._seen_tokens = past_key_value._seen_tokens + retrieve_k.shape[-2]
                 # update position_ids & cache_positions
                 self.history_context_len = self.kv_cache_manager.history_token_cnt
+            
         position_ids = position_ids + self.history_context_len
         position_embeddings = self.rotary_emb(hidden_states, position_ids)  
         
@@ -420,6 +404,8 @@ class LlamaAttention(nn.Module):
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+        
+        st = time()
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -444,6 +430,8 @@ class LlamaAttention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
+        if q_len > 1:
+            self.kv_cache_manager.log_time("attn_time", time() - st)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -696,16 +684,16 @@ LLAMA_ATTENTION_CLASSES = {
 
 class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int, 
-                 kv_cache_manager: KVCacheManager, block_size: int = 64, topk: int = 5):
+                 kv_cache_manager: KVCacheManager, block_size: int = 64, topk_threshold: float = 0.9):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.kv_cacahe_manger = kv_cache_manager
         self.block_size = block_size
-        self.topk = topk
+        self.topk_threshold = topk_threshold
         #强制启用eager模式
         config._attn_implementation = "eager"
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx, 
-                                    kv_cache_manager=kv_cache_manager,block_size=self.block_size, topk=self.topk)
+                                    kv_cache_manager=kv_cache_manager,block_size=self.block_size, topk_threshold=self.topk_threshold)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -914,26 +902,26 @@ class LlamaModel(LlamaPreTrainedModel):
         config: LlamaConfig
     """
 
-    def __init__(self, config: LlamaConfig, block_size: int = 64, topk: int = 5):
+    def __init__(self, config: LlamaConfig, block_size: int = 64, topk_threshold: float = 0.9):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         # 新增缓存管理器
-        self.kv_cache_manager = KVCacheManager()
+        self.kv_cache_manager = KVCacheManager(block_size=block_size, topk_threshold=topk_threshold)
         self.block_size = block_size
-        self.topk = topk
+        self.topk_threshold = topk_threshold
         self._tail_tokens: List[int] = []
         self._tail_cache: Optional[DynamicCache] = DynamicCache()
         self.save_cnt = 0
         print("----------------------------------------")
         print("| block_size =  "+ str(self.block_size))
-        print("| topk =  " + str(self.topk))
+        print("| topk_threshold =  " + str(self.topk_threshold))
         print("----------------------------------------")
         
         
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx, self.kv_cache_manager, self.block_size, self.topk) 
+            [LlamaDecoderLayer(config, layer_idx, self.kv_cache_manager, self.block_size, self.topk_threshold) 
              for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1046,6 +1034,9 @@ class LlamaModel(LlamaPreTrainedModel):
         # 用来存下一步的 KVCache
         next_decoder_cache = None
         # 依次经过模型的每一层
+        _, q_len, _ = hidden_states.size()
+        if q_len > 1:
+            forward_pass_st = time()
         for decoder_layer in self.layers:
             # 如果需要输出隐藏状态，则将当前 hidden_states 保存起来
             if output_hidden_states:
@@ -1089,6 +1080,9 @@ class LlamaModel(LlamaPreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         # 每个 Decoder Layer 执行完后，会得到最终的 hidden_states
+        if q_len > 1:
+            total_forward_time = time() - forward_pass_st
+            self.kv_cache_manager.finalize_and_log_times(total_forward_time)
         hidden_states = self.norm(hidden_states)
 
         # 根据配置决定是否返回新的缓存
@@ -1132,18 +1126,18 @@ class LlamaModel(LlamaPreTrainedModel):
         if len(self._tail_cache.key_cache) == 0:
             for layer_idx in range(self.config.num_hidden_layers):
                 # Clone the sliced tensors before appending
-                self._tail_cache.key_cache.append(past_key_values.key_cache[layer_idx][..., -input_ids.shape[1]:, :].clone())
-                self._tail_cache.value_cache.append(past_key_values.value_cache[layer_idx][..., -input_ids.shape[1]:, :].clone())
+                self._tail_cache.key_cache.append(past_key_values.key_cache[layer_idx][..., -input_ids.shape[1]:, :])
+                self._tail_cache.value_cache.append(past_key_values.value_cache[layer_idx][..., -input_ids.shape[1]:, :])
         else:
             for layer_idx in range(self.config.num_hidden_layers):
                 # Clone the existing and new tensors before concatenating
                 self._tail_cache.key_cache[layer_idx] = torch.cat((
-                    self._tail_cache.key_cache[layer_idx].clone(),
-                    past_key_values.key_cache[layer_idx][..., -input_ids.shape[1]:, :].clone()
+                    self._tail_cache.key_cache[layer_idx],
+                    past_key_values.key_cache[layer_idx][..., -input_ids.shape[1]:, :]
                 ), dim=-2)
                 self._tail_cache.value_cache[layer_idx] = torch.cat((
-                    self._tail_cache.value_cache[layer_idx].clone(),
-                    past_key_values.value_cache[layer_idx][..., -input_ids.shape[1]:, :].clone()
+                    self._tail_cache.value_cache[layer_idx],
+                    past_key_values.value_cache[layer_idx][..., -input_ids.shape[1]:, :]
                 ), dim=-2)
         # Store KVCache Block & Digest
         if len(self._tail_tokens)>= self.block_size:
@@ -1158,6 +1152,9 @@ class LlamaModel(LlamaPreTrainedModel):
             kv_num_chunks = store_length // self.block_size 
             tail_length = store_length % self.block_size
             for i in range(kv_num_chunks):
+                self.save_cnt += 1
+                if self.save_cnt == 2:
+                    continue
                 start = i * self.block_size
                 end = start + self.block_size
                 search_res = self.kv_cache_manager.is_exist(self._tail_tokens[start:end])
@@ -1325,9 +1322,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
     def __init__(self, config,
                  block_size: int = 64,
-                 topk: int = 5):
+                 topk_threshold: float = 0.9):
         super().__init__(config)
-        self.model = LlamaModel(config,block_size,topk)
+        self.model = LlamaModel(config,block_size,topk_threshold)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
