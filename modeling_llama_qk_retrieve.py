@@ -283,13 +283,11 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None, kv_cache_manager: KVCacheManager = None, 
-                 block_size: int = 64, topk_threshold: float = 0.9):
+    def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None, kv_cache_manager: KVCacheManager = None, topk_threshold: float = 0.9):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.kv_cache_manager = kv_cache_manager
-        self.block_size = block_size
         self.topk_threshold = topk_threshold
         if layer_idx is None:
             logger.warning_once(
@@ -684,16 +682,15 @@ LLAMA_ATTENTION_CLASSES = {
 
 class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int, 
-                 kv_cache_manager: KVCacheManager, block_size: int = 64, topk_threshold: float = 0.9):
+                 kv_cache_manager: KVCacheManager, topk_threshold: float = 0.9):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.kv_cacahe_manger = kv_cache_manager
-        self.block_size = block_size
         self.topk_threshold = topk_threshold
         #强制启用eager模式
         config._attn_implementation = "eager"
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx, 
-                                    kv_cache_manager=kv_cache_manager,block_size=self.block_size, topk_threshold=self.topk_threshold)
+                                    kv_cache_manager=kv_cache_manager, topk_threshold=self.topk_threshold)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -902,26 +899,24 @@ class LlamaModel(LlamaPreTrainedModel):
         config: LlamaConfig
     """
 
-    def __init__(self, config: LlamaConfig, block_size: int = 64, topk_threshold: float = 0.9):
+    def __init__(self, config: LlamaConfig, topk_threshold: float = 0.9):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         # 新增缓存管理器
-        self.kv_cache_manager = KVCacheManager(block_size=block_size, topk_threshold=topk_threshold)
-        self.block_size = block_size
+        self.kv_cache_manager = KVCacheManager(topk_threshold=topk_threshold)
         self.topk_threshold = topk_threshold
         self._tail_tokens: List[int] = []
         self._tail_cache: Optional[DynamicCache] = DynamicCache()
         self.save_cnt = 0
         print("----------------------------------------")
-        print("| block_size =  "+ str(self.block_size))
         print("| topk_threshold =  " + str(self.topk_threshold))
         print("----------------------------------------")
         
         
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx, self.kv_cache_manager, self.block_size, self.topk_threshold) 
+            [LlamaDecoderLayer(config, layer_idx, self.kv_cache_manager, self.topk_threshold) 
              for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1140,47 +1135,39 @@ class LlamaModel(LlamaPreTrainedModel):
                     past_key_values.value_cache[layer_idx][..., -input_ids.shape[1]:, :]
                 ), dim=-2)
         # Store KVCache Block & Digest
-        if len(self._tail_tokens)>= self.block_size:
-            """
-            print("++++++++++++++++++++++++++++++++++++++++")
-            print("+ len(self._tail_tokens) = " + str(len(self._tail_tokens)))
-            print("+ len(self._tail_cache) = " + str(len(self._tail_cache.key_cache)))
-            print("+ shape(self._tail_cache.key_cache) = " + str(self._tail_cache.key_cache[0].shape))
-            print("++++++++++++++++++++++++++++++++++++++++")
-            #&"""
-            store_length = len(self._tail_tokens)
-            kv_num_chunks = store_length // self.block_size 
-            tail_length = store_length % self.block_size
-            for i in range(kv_num_chunks):
-                start = i * self.block_size
-                end = start + self.block_size
-                search_res = self.kv_cache_manager.is_exist(self._tail_tokens[start:end])
-                if search_res == False:
-                    save_key_value = self._tail_cache.get_cache_slice(start, end)
-                    self.kv_cache_manager.save_cache(
-                        self._tail_tokens[start:end], 
-                        save_key_value
-                    )
-                    self.kv_cache_manager.save_digest_cache(
-                        self._tail_tokens[start:end], 
-                        save_key_value.key_cache
-                    )
-            # maintain tail
-            if tail_length == 0:
-                self._tail_tokens = []
-                self._tail_cache = DynamicCache()
-            else:
-                self._tail_tokens = self._tail_tokens[-tail_length:]
+        # Define punctuation token IDs
+        punctuation_ids = {
+            self.kv_cache_manager.tokenizer.encode(p, add_special_tokens=False)[0]
+            for p in ['.', '?', '!', ',', ';', ':']
+        }
+
+        # Find split points
+        split_indices = [i + 1 for i, token_id in enumerate(self._tail_tokens) if token_id in punctuation_ids]
+
+        # Process chunks
+        last_split = 0
+        for split_point in split_indices:
+            chunk = self._tail_tokens[last_split:split_point]
+            if not chunk:
+                continue
+
+            search_res = self.kv_cache_manager.is_exist(chunk)
+            if not search_res:
+                save_key_value = self._tail_cache.get_cache_slice(last_split, split_point)
+                self.kv_cache_manager.save_cache(chunk, save_key_value)
+                self.kv_cache_manager.save_digest_cache(chunk, save_key_value.key_cache)
+            
+            last_split = split_point
+
+        # Update tail
+        if last_split > 0:
+            self._tail_tokens = self._tail_tokens[last_split:]
+            if self._tail_tokens:
                 for layer_idx in range(self.config.num_hidden_layers):
-                    self._tail_cache.key_cache[layer_idx] = self._tail_cache.key_cache[layer_idx][...,-tail_length:,:]
-                    self._tail_cache.value_cache[layer_idx] = self._tail_cache.value_cache[layer_idx][...,-tail_length:,:]
-            """
-            print("----------------------------------------")
-            print("| history_token_cnt =  "+ str(self.kv_cache_manager.history_token_cnt))
-            print("| saved_input_ids cnt =  " + str(len(self.kv_cache_manager.input_ids_list)))
-            print("| saved_cache cnt =  " + str(len(self.kv_cache_manager.kv_cache)))
-            print("----------------------------------------")
-            #&"""
+                    self._tail_cache.key_cache[layer_idx] = self._tail_cache.key_cache[layer_idx][..., -len(self._tail_tokens):, :]
+                    self._tail_cache.value_cache[layer_idx] = self._tail_cache.value_cache[layer_idx][..., -len(self._tail_tokens):, :]
+            else:
+                self._tail_cache = DynamicCache()
         #if len(past_key_values.key_cache):
         #    print("++** " + str(past_key_values.key_cache[0].shape[-2]))  
         
@@ -1318,10 +1305,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config,
-                 block_size: int = 64,
                  topk_threshold: float = 0.9):
         super().__init__(config)
-        self.model = LlamaModel(config,block_size,topk_threshold)
+        self.model = LlamaModel(config, topk_threshold)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 

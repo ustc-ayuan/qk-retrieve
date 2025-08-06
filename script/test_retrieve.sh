@@ -6,7 +6,7 @@ MODEL_PATH="/mnt/sda1/Llama-3.1-8B"
 
 # 定义 block_size 和 topk 的可能值
 BLOCK_SIZES=(8 16)
-TOPK_VALUES=(0.25 0.5 0.75 0.9)
+TOPK_VALUES=(0.1 0.3 0.7)
 
 # 遍历所有可能的组合
 for BLOCK_SIZE in "${BLOCK_SIZES[@]}"; do

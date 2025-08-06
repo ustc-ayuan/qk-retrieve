@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from transformers.cache_utils import Cache
 from copy import deepcopy
+import torch.nn.functional as F
 import threading
 from time import time
 import multiprocessing
@@ -33,7 +34,6 @@ class KVCacheManager:
                  memory_capacity: int = 2000, 
                  hbm_capacity = 20,
                  disk_path: Optional[str] = "/mnt/sda1/homie_cache/",
-                 block_size: int = 64,
                  topk_threshold: float = 0.9):
         self.disk_path = disk_path
         self.hbm_capacity = hbm_capacity
@@ -44,20 +44,20 @@ class KVCacheManager:
         self.input_ids_list: List[List[int]] = []
         self.hash_key_list: List[str] = []
         self.kv_cache: Dict[str, DynamicCache] = {}
-        self.memory_digest_cache: Dict[str, List[Digest]] = {}
+        self.memory_digest_cache: Dict[str, Tuple[List[Digest], int]] = {}
         self.retrieve_cnt = -1
         
         # Logging setup
-        self.log_dir = f"logs/block_size_{block_size}_threshold_{topk_threshold}"
+        self.log_dir = f"test/threshold_{topk_threshold}"
         os.makedirs(self.log_dir, exist_ok=True)
         self.topk_log_file = os.path.join(self.log_dir, "dynamic_topk.log")
         self.time_log_file = os.path.join(self.log_dir, "timing.log")
 
         # Clear log files at initialization
         with open(self.topk_log_file, "w") as f:
-            f.write("request_id,layer_idx,max_k\n")
-        with open(self.time_log_file, "w") as f:
-            f.write("request_id,total_forward_time,total_topk_time,total_concat_time,total_attn_time,other_time\n")
+            f.write("request_id,layer_idx,max_len\n")
+        #with open(self.time_log_file, "w") as f:
+        #    f.write("request_id,total_forward_time,total_topk_time,total_concat_time,total_attn_time,other_time\n")
 
         # Time accumulators for the current request
         self.current_topk_time = 0
@@ -98,6 +98,7 @@ class KVCacheManager:
         # (bsz, head_num, k_len, head_dim)
         key = self._generate_key(token_ids)
         digest = []
+        chunk_len = len(token_ids)
 
         # Bounding-cuboid digest
         for key_tensor in key_cache:
@@ -113,7 +114,7 @@ class KVCacheManager:
             mins = centers - dists
             digest.append((maxs, mins))
 
-        self.memory_digest_cache[key] = digest
+        self.memory_digest_cache[key] = (digest, chunk_len)
 
     def log_time(self, event_type: str, duration: float):
         if event_type == "topk_time":
@@ -125,8 +126,8 @@ class KVCacheManager:
 
     def finalize_and_log_times(self, total_forward_time: float):
         other_time = total_forward_time - self.current_topk_time - self.current_concat_time - self.current_attn_time
-        with open(self.time_log_file, "a") as f:
-            f.write(f"{self.retrieve_cnt},{total_forward_time},{self.current_topk_time},{self.current_concat_time},{self.current_attn_time},{other_time}\n")
+        #with open(self.time_log_file, "a") as f:
+        #    f.write(f"{self.retrieve_cnt},{total_forward_time},{self.current_topk_time},{self.current_concat_time},{self.current_attn_time},{other_time}\n")
         
         # Reset accumulators
         self.current_topk_time = 0
@@ -147,19 +148,24 @@ class KVCacheManager:
         # TODO: 这里的tensor构建是十分低效的
         max_digest_list = []
         min_digest_list = []
+        len_list = []
         for key in self.hash_key_list:
-            if len(self.memory_digest_cache[key]) > 0:
-                max_digest_list.append(self.memory_digest_cache[key][layer_idx][0])
-                min_digest_list.append(self.memory_digest_cache[key][layer_idx][1])
+            if key in self.memory_digest_cache:
+                digest_data, chunk_len = self.memory_digest_cache[key]
+                if len(digest_data) > 0:
+                    max_digest_list.append(digest_data[layer_idx][0])
+                    min_digest_list.append(digest_data[layer_idx][1])
+                    len_list.append(chunk_len)
         
         if not max_digest_list:
             return torch.empty(0, 0, 0, 0, device=query_vector.device), torch.empty(0, 0, 0, 0, device=query_vector.device)
 
         max_digest = torch.stack(max_digest_list, dim=2).to(query_vector.device)
         min_digest = torch.stack(min_digest_list, dim=2).to(query_vector.device)
+        chunk_lens = torch.tensor(len_list, device=query_vector.device, dtype=torch.float32)
         
         st = time()
-        scores = self.related_score_eval(query_vector, max_digest, min_digest, layer_idx, num_key_value_groups)
+        scores = self.related_score_eval(query_vector, max_digest, min_digest, chunk_lens, layer_idx, num_key_value_groups)
         
         head_num, k_len = scores.shape
         scores_double = scores.to(torch.float64)
@@ -179,10 +185,8 @@ class KVCacheManager:
         max_k = k_for_threshold.max().item()
         self.log_time("topk_time", time() - st)
         
-        # Log the dynamic topk value
-        with open(self.topk_log_file, "a") as f:
-            f.write(f"{self.retrieve_cnt},{layer_idx},{max_k}\n")
-        print(f"Request: {self.retrieve_cnt}, Layer: {layer_idx}, Dynamic TopK: {max_k}")
+        
+        #print(f"Request: {self.retrieve_cnt}, Layer: {layer_idx}, Dynamic TopK: {max_k}")
 
         # Get the top indices based on max_k
         top_indices = sorted_indices[:, :max_k]
@@ -190,33 +194,72 @@ class KVCacheManager:
         st = time()
         head_retrieve_k_list = []
         head_retrieve_v_list = []
+        max_len = 0
+
+        # Step 1: For each head, concatenate the retrieved KV caches.
         for head_idx in range(head_num):
             head_top_indices = top_indices[head_idx]
-            
-            # Sort these indices to maintain order for concatenation
             sorted_head_top_indices = torch.sort(head_top_indices).values
             
             k_list = []
             v_list = []
             for idx in sorted_head_top_indices.tolist():
                 key = self.hash_key_list[idx]
+                if head_idx == 0:
+                    print("++idx: ", idx)
+                    print("++text: ", self.tokenizer.decode(self.input_ids_list[idx], skip_special_tokens=True))
                 k_list.append(self.kv_cache[key].key_cache[layer_idx][:, head_idx:head_idx+1, :, :])
                 v_list.append(self.kv_cache[key].value_cache[layer_idx][:, head_idx:head_idx+1, :, :])
             
             if k_list:
-                head_retrieve_k_list.append(torch.cat(k_list, dim=-2).cuda())
-                head_retrieve_v_list.append(torch.cat(v_list, dim=-2).cuda())
+                concatenated_k = torch.cat(k_list, dim=-2)
+                concatenated_v = torch.cat(v_list, dim=-2)
+                head_retrieve_k_list.append(concatenated_k)
+                head_retrieve_v_list.append(concatenated_v)
+            else:
+                # Keep placeholders for heads that retrieved nothing
+                head_retrieve_k_list.append(None)
+                head_retrieve_v_list.append(None)
 
-        if not head_retrieve_k_list:
+        # Step 2: Find the maximum sequence length across all heads' concatenated caches.
+        for k_tensor in head_retrieve_k_list:
+            if k_tensor is not None:
+                max_len = max(max_len, k_tensor.shape[-2])
+
+        # Log the dynamic topk value
+        with open(self.topk_log_file, "a") as f:
+            f.write(f"{self.retrieve_cnt},{layer_idx},{max_len}\n")
+        
+        if max_len == 0:
             return torch.empty(0, 0, 0, 0, device=query_vector.device), torch.empty(0, 0, 0, 0, device=query_vector.device)
 
-        retrieve_k = torch.cat(head_retrieve_k_list, dim=1).cuda()
-        retrieve_v = torch.cat(head_retrieve_v_list, dim=1).cuda()
+        # Step 3: Pad each head's concatenated cache to the max_len.
+        padded_k_list = []
+        padded_v_list = []
+        for k_tensor, v_tensor in zip(head_retrieve_k_list, head_retrieve_v_list):
+            if k_tensor is not None:
+                pad_len = max_len - k_tensor.shape[-2]
+                if pad_len > 0:
+                    # Pad with 0s at the end of the sequence dimension.
+                    k_tensor = F.pad(k_tensor, (0, 0, 0, pad_len), "constant", 0)
+                    v_tensor = F.pad(v_tensor, (0, 0, 0, pad_len), "constant", 0)
+                padded_k_list.append(k_tensor.cuda())
+                padded_v_list.append(v_tensor.cuda())
+            else:
+                # For heads that retrieved nothing, create a zero tensor of the correct padded shape.
+                bsz, _, _, head_dim = query_vector.shape
+                zero_tensor_shape = (bsz, 1, max_len, head_dim)
+                padded_k_list.append(torch.zeros(zero_tensor_shape, device='cuda', dtype=query_vector.dtype))
+                padded_v_list.append(torch.zeros(zero_tensor_shape, device='cuda', dtype=query_vector.dtype))
+
+        # Step 4: Concatenate all padded head caches into a single tensor.
+        retrieve_k = torch.cat(padded_k_list, dim=1)
+        retrieve_v = torch.cat(padded_v_list, dim=1)
         self.log_time("concat_time", time() - st)
         
         return retrieve_k, retrieve_v
         
-    def related_score_eval(self, query: torch.Tensor, max_digest: torch.Tensor, min_digest: torch.Tensor,
+    def related_score_eval(self, query: torch.Tensor, max_digest: torch.Tensor, min_digest: torch.Tensor, chunk_lens: torch.Tensor,
                            layer_idx: int = 0, num_key_value_groups: int = 8) -> torch.Tensor:
         batch, q_num_key_value_heads, qlen, head_dim = query.shape
         batch, k_num_key_value_heads, klen, head_dim = max_digest.shape
@@ -261,7 +304,11 @@ class KVCacheManager:
                 print("sum")
             related_score = detailed_scores.sum(dim=-2) # (bsz, head_num, k_len)
         
+        
+        # Reshape for GQA grouping.
         related_score = related_score.reshape(batch, k_num_key_value_heads, n_rep, klen)
-        # 对每个组求和
-        related_score = related_score.sum(dim=2)  # (bsz, q_num_key_value_heads, k_len)
-        return related_score.squeeze(0) # (head_num, k_len)
+        # Sum scores across the query heads of each KV group.
+        related_score = related_score.sum(dim=2).squeeze(0)  # Shape: (k_num_key_value_heads, klen)
+        # weight
+        #related_score = related_score * chunk_lens.view(1, -1)
+        return related_score 
