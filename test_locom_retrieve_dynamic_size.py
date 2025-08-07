@@ -6,12 +6,14 @@ from transformers import AutoTokenizer
 
 def main():
     parser = argparse.ArgumentParser(description="Run LlamaForCausalLM with different parameters.")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to the model.")
     parser.add_argument("--topk_threshold", type=float, required=True, help="Top-k threshold for the model.")
+    parser.add_argument("--output_path", type=str, required=True, help="Path to save the results.")
     args = parser.parse_args()
 
-    model_path = "/mnt/sda1/Llama-3.1-8B"
+    model_path = args.model_path #"/mnt/sda1/Llama-3.1-8B"
     topk_threshold = args.topk_threshold
-    output_path = "./dynamic_block_size_ans.log"
+    output_path = args.output_path
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     

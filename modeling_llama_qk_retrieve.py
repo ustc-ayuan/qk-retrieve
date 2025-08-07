@@ -1138,26 +1138,29 @@ class LlamaModel(LlamaPreTrainedModel):
         # Define punctuation token IDs
         punctuation_ids = {
             self.kv_cache_manager.tokenizer.encode(p, add_special_tokens=False)[0]
-            for p in ['.', '?', '!', ',', ';', ':']
+            for p in ['.', '?', '!', ';', ':']
         }
 
         # Find split points
         split_indices = [i + 1 for i, token_id in enumerate(self._tail_tokens) if token_id in punctuation_ids]
 
-        # Process chunks
+        # Process chunks, ensuring a minimum length
         last_split = 0
+        min_chunk_size = 16
         for split_point in split_indices:
-            chunk = self._tail_tokens[last_split:split_point]
-            if not chunk:
-                continue
+            chunk_len = split_point - last_split
+            if chunk_len >= min_chunk_size:
+                chunk = self._tail_tokens[last_split:split_point]
+                if not chunk:
+                    continue
 
-            search_res = self.kv_cache_manager.is_exist(chunk)
-            if not search_res:
-                save_key_value = self._tail_cache.get_cache_slice(last_split, split_point)
-                self.kv_cache_manager.save_cache(chunk, save_key_value)
-                self.kv_cache_manager.save_digest_cache(chunk, save_key_value.key_cache)
-            
-            last_split = split_point
+                search_res = self.kv_cache_manager.is_exist(chunk)
+                if not search_res:
+                    save_key_value = self._tail_cache.get_cache_slice(last_split, split_point)
+                    self.kv_cache_manager.save_cache(chunk, save_key_value)
+                    self.kv_cache_manager.save_digest_cache(chunk, save_key_value.key_cache)
+                
+                last_split = split_point
 
         # Update tail
         if last_split > 0:

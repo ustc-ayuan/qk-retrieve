@@ -205,7 +205,7 @@ class KVCacheManager:
             v_list = []
             for idx in sorted_head_top_indices.tolist():
                 key = self.hash_key_list[idx]
-                if head_idx == 0:
+                if head_idx == 0 and layer_idx == 0:
                     print("++idx: ", idx)
                     print("++text: ", self.tokenizer.decode(self.input_ids_list[idx], skip_special_tokens=True))
                 k_list.append(self.kv_cache[key].key_cache[layer_idx][:, head_idx:head_idx+1, :, :])
@@ -240,9 +240,8 @@ class KVCacheManager:
             if k_tensor is not None:
                 pad_len = max_len - k_tensor.shape[-2]
                 if pad_len > 0:
-                    # Pad with 0s at the end of the sequence dimension.
-                    k_tensor = F.pad(k_tensor, (0, 0, 0, pad_len), "constant", 0)
-                    v_tensor = F.pad(v_tensor, (0, 0, 0, pad_len), "constant", 0)
+                    k_tensor = F.pad(k_tensor, (0, 0, pad_len, 0 ), "constant", 0)
+                    v_tensor = F.pad(v_tensor, (0, 0, pad_len, 0), "constant", 0)
                 padded_k_list.append(k_tensor.cuda())
                 padded_v_list.append(v_tensor.cuda())
             else:
