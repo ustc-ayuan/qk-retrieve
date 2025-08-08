@@ -34,11 +34,14 @@ class KVCacheManager:
                  hbm_capacity = 20,
                  disk_path: Optional[str] = "/mnt/sda1/homie_cache/",
                  block_size: int = 64,
-                 topk_threshold: float = 0.9):
+                 topk_threshold: float = 0.9,
+                 mts_strategy: str = "SUM",
+                 log_dir: Optional[str] = None):
         self.disk_path = disk_path
         self.hbm_capacity = hbm_capacity
         self.memory_capacity = memory_capacity
         self.tokenizer = AutoTokenizer.from_pretrained("/mnt/sda1/Llama-3.1-8B")
+        self.mts_strategy = mts_strategy
         
         self.history_token_cnt = 0
         self.input_ids_list: List[List[int]] = []
@@ -48,16 +51,21 @@ class KVCacheManager:
         self.retrieve_cnt = -1
         
         # Logging setup
-        self.log_dir = f"logs/block_size_{block_size}_threshold_{topk_threshold}"
+        if log_dir is None:
+            self.log_dir = f"logs/block_size_{block_size}_threshold_{topk_threshold}_mts_{self.mts_strategy}"
+        else:
+            self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
         self.topk_log_file = os.path.join(self.log_dir, "dynamic_topk.log")
         self.time_log_file = os.path.join(self.log_dir, "timing.log")
 
-        # Clear log files at initialization
-        with open(self.topk_log_file, "w") as f:
-            f.write("request_id,layer_idx,max_k\n")
-        with open(self.time_log_file, "w") as f:
-            f.write("request_id,total_forward_time,total_topk_time,total_concat_time,total_attn_time,other_time\n")
+        # Append to log files, write header if file doesn't exist
+        if not os.path.exists(self.topk_log_file):
+            with open(self.topk_log_file, "w") as f:
+                f.write("request_id,layer_idx,max_topk,max_len\n")
+        if not os.path.exists(self.time_log_file):
+            with open(self.time_log_file, "w") as f:
+                f.write("request_id,total_forward_time,total_topk_time,total_concat_time,total_attn_time,other_time\n")
 
         # Time accumulators for the current request
         self.current_topk_time = 0
@@ -179,10 +187,6 @@ class KVCacheManager:
         max_k = k_for_threshold.max().item()
         self.log_time("topk_time", time() - st)
         
-        # Log the dynamic topk value
-        with open(self.topk_log_file, "a") as f:
-            f.write(f"{self.retrieve_cnt},{layer_idx},{max_k}\n")
-        print(f"Request: {self.retrieve_cnt}, Layer: {layer_idx}, Dynamic TopK: {max_k}")
 
         # Get the top indices based on max_k
         top_indices = sorted_indices[:, :max_k]
@@ -214,6 +218,11 @@ class KVCacheManager:
         retrieve_v = torch.cat(head_retrieve_v_list, dim=1).cuda()
         self.log_time("concat_time", time() - st)
         
+        max_len = retrieve_k.shape[-2]
+        with open(self.topk_log_file, "a") as f:
+            f.write(f"{self.retrieve_cnt},{layer_idx},{max_k},{max_len}\n")
+        #print(f"Request: {self.retrieve_cnt}, Layer: {layer_idx}, Dynamic TopK: {max_k}, max_len: {max_len}")
+
         return retrieve_k, retrieve_v
         
     def related_score_eval(self, query: torch.Tensor, max_digest: torch.Tensor, min_digest: torch.Tensor,
@@ -246,20 +255,20 @@ class KVCacheManager:
         if torch.isinf(detailed_scores).any() or torch.isnan(detailed_scores).any():
             print("scores contains inf or NaN")
             assert 1==2
-        RRF = True
-        if RRF:
+
+        if self.mts_strategy == "RRF":
             # 将 scores 转换为排名
-            if layer_idx==0:
-                print("rrf")
             ranks = torch.argsort(detailed_scores, dim=-1, descending=True).argsort(dim=-1) + 1  # (bsz, head_num, q_len, k_len)
             # 应用 RRF 公式
             k = 60  # RRF 参数，通常设置为 60
             rrf_scores = 1 / (k + ranks.float())  # (bsz, head_num, q_len, k_len)
             related_score = rrf_scores.sum(dim=-2)  # (bsz, head_num, k_len)
-        else:
-            if layer_idx==0:
-                print("sum")
+        elif self.mts_strategy == "SUM":
             related_score = detailed_scores.sum(dim=-2) # (bsz, head_num, k_len)
+        elif self.mts_strategy == "MAX":
+            related_score = detailed_scores.max(dim=-2).values # (bsz, head_num, k_len)
+        else:
+            raise ValueError(f"Unknown mts_strategy: {self.mts_strategy}")
         
         related_score = related_score.reshape(batch, k_num_key_value_heads, n_rep, klen)
         # 对每个组求和

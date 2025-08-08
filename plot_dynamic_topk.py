@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import re
 
-def plot_dynamic_topk_distribution(log_dir='logs'):
+def plot_dynamic_topk_distribution(log_dir='logs_sum'):
     """
     Analyzes and visualizes the distribution of dynamic top-K values from log files.
 
@@ -40,6 +40,7 @@ def plot_dynamic_topk_distribution(log_dir='logs'):
     fig, axes = plt.subplots(num_experiments, 1, figsize=(15, 8 * num_experiments), squeeze=False)
     fig.suptitle('Distribution of Dynamic Top-K Values Across Layers', fontsize=20)
 
+    stats_data = []
     # Process each experiment's log file
     for i, exp_dir in enumerate(experiment_dirs):
         log_file = os.path.join(log_dir, exp_dir, 'dynamic_topk.log')
@@ -51,6 +52,16 @@ def plot_dynamic_topk_distribution(log_dir='logs'):
         # Read and process the data
         df = pd.read_csv(log_file)
         
+        # Calculate overall statistics for the experiment
+        overall_mean = df['max_k'].mean()
+        overall_p90 = df['max_k'].quantile(0.9)
+
+        stats_data.append({
+            'Experiment': exp_dir,
+            'Average Top-K': f'{overall_mean:.2f}',
+            'P90 Top-K': f'{overall_p90:.2f}'
+        })
+
         # Create a box plot for the current experiment
         ax = axes[i, 0]
         sns.boxplot(x='layer_idx', y='max_k', data=df, ax=ax)
@@ -63,6 +74,12 @@ def plot_dynamic_topk_distribution(log_dir='logs'):
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     
+    # Print the statistics table
+    if stats_data:
+        stats_df = pd.DataFrame(stats_data)
+        print("Summary of Dynamic Top-K Statistics:")
+        print(stats_df.to_string(index=False))
+
     # Save the combined plot
     output_path = os.path.join(log_dir, 'dynamic_topk_distribution.png')
     plt.savefig(output_path)

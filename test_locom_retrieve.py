@@ -9,6 +9,8 @@ def main():
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model.")
     parser.add_argument("--block_size", type=int, required=True, help="Block size for the model.")
     parser.add_argument("--topk_threshold", type=float, required=True, help="Top-k threshold for the model.")
+    parser.add_argument("--mts_strategy", type=str, default="SUM", choices=["SUM", "RRF", "MAX"], help="MTS strategy.")
+    parser.add_argument("--log_dir", type=str, default=None, help="Directory to save logs.")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save the results.")
     args = parser.parse_args()
 
@@ -28,7 +30,7 @@ def main():
     for data in all_data:
         print("Starting new conversation...")
         # 每次对话重新加载模型
-        model = LlamaForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, block_size=block_size, topk_threshold=topk_threshold).cuda()
+        model = LlamaForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, block_size=block_size, topk_threshold=topk_threshold, mts_strategy=args.mts_strategy, log_dir=args.log_dir).cuda()
         model.eval()
 
         # 提取 conversation 数据

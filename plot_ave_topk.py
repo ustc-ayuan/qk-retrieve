@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import re
 
-def plot_f1_and_tokens_by_threshold(log_dir='logs'):
+def plot_f1_and_tokens_by_threshold(log_dir='logs_rrf'):
     """
     Analyzes and visualizes the F1 scores and average retrieved tokens by threshold for specific block sizes.
 
@@ -17,10 +17,10 @@ def plot_f1_and_tokens_by_threshold(log_dir='logs'):
     """
     # 提供的 F1 数据
     block_sizes = [8, 16]
-    topk_values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99]
+    topk_values = [0.1,  0.3,  0.5,  0.7,  0.9]
     f1_scores = {
-        8: [0.2224, 0.2826, 0.3099, 0.3322, 0.3702, 0.3510, 0.3513, 0.3758, 0.3912, 0.3905],
-        16: [0.2015, 0.2482, 0.3364, 0.3613, 0.3500, 0.3622, 0.3608, 0.3757, 0.3772, 0.3773]
+        8: [0.2116, 0.2781, 0.3044, 0.2795, 0.2972],
+        16: [0.1636, 0.2548, 0.2681, 0.2790, 0.2762]
     }
 
     # 准备存储平均检索到的 Token 数
@@ -86,7 +86,7 @@ def plot_f1_and_tokens_by_threshold(log_dir='logs'):
     ax2.tick_params(axis='y', labelcolor='tab:red', labelsize=18)
 
     # 添加一条值为 0.3709 的横虚线
-    ax1.axhline(y=0.3709, color='r', linestyle='--', linewidth=2, label='Full Context Precision')
+    ax1.axhline(y=0.2889, color='r', linestyle='--', linewidth=2, label='Full Context Precision')
 
     # 添加图例
     fig.tight_layout()

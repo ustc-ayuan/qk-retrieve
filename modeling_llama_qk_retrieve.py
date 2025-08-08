@@ -378,8 +378,8 @@ class LlamaAttention(nn.Module):
         position_ids = position_ids + self.history_context_len
         position_embeddings = self.rotary_emb(hidden_states, position_ids)  
         
-        if self.layer_idx == 0:
-            print("position_ids",position_ids)
+        #if self.layer_idx == 0:
+        #    print("position_ids",position_ids)
                       
         if position_embeddings is None:
             logger.warning_once(
@@ -902,26 +902,28 @@ class LlamaModel(LlamaPreTrainedModel):
         config: LlamaConfig
     """
 
-    def __init__(self, config: LlamaConfig, block_size: int = 64, topk_threshold: float = 0.9):
+    def __init__(self, config: LlamaConfig, block_size: int = 64, topk_threshold: float = 0.9, mts_strategy: str = "SUM", log_dir: Optional[str] = None):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         # 新增缓存管理器
-        self.kv_cache_manager = KVCacheManager(block_size=block_size, topk_threshold=topk_threshold)
+        self.kv_cache_manager = KVCacheManager(block_size=block_size, topk_threshold=topk_threshold, mts_strategy=mts_strategy, log_dir=log_dir)
         self.block_size = block_size
         self.topk_threshold = topk_threshold
+        self.mts_strategy = mts_strategy
         self._tail_tokens: List[int] = []
         self._tail_cache: Optional[DynamicCache] = DynamicCache()
         self.save_cnt = 0
         print("----------------------------------------")
         print("| block_size =  "+ str(self.block_size))
         print("| topk_threshold =  " + str(self.topk_threshold))
+        print("| mts_strategy = " + str(self.mts_strategy))
         print("----------------------------------------")
         
         
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx, self.kv_cache_manager, self.block_size, self.topk_threshold) 
+            [LlamaDecoderLayer(config, layer_idx, self.kv_cache_manager, self.block_size, self.topk_threshold)
              for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -966,8 +968,8 @@ class LlamaModel(LlamaPreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        if len(input_ids[0])>1:
-            print("len(input_ids[0])",input_ids.shape)
+        #if len(input_ids[0])>1:
+            #print("len(input_ids[0])",input_ids.shape)
         # 检查：input_ids 和 inputs_embeds 不能同时为空或同时非空，必须二选一
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1319,9 +1321,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
     def __init__(self, config,
                  block_size: int = 64,
-                 topk_threshold: float = 0.9):
+                 topk_threshold: float = 0.9,
+                 mts_strategy: str = "SUM",
+                 log_dir: Optional[str] = None):
         super().__init__(config)
-        self.model = LlamaModel(config,block_size,topk_threshold)
+        self.model = LlamaModel(config,block_size,topk_threshold, mts_strategy, log_dir)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
