@@ -11,3 +11,5 @@ simple_test/*
 logs/*
 *logs*/*
 MISC/*
+*.png
+*.pdf
