@@ -406,30 +406,31 @@ class LlamaAttention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         
         st = time()
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            if attn_weights.shape[-1] != causal_mask.shape[-1]:
-                padding_mask =F.pad(causal_mask,(attn_weights.shape[-1] - causal_mask.shape[-1], 0))
-                attn_weights = attn_weights + padding_mask
-                """
-                print("causal_mask")
-                print(causal_mask.shape)
-                print("padding_mask")
-                print(padding_mask.shape)
-                print("attn_weight")
-                print(attn_weights.shape)
-                print(causal_mask[:,:,:20,:])
-                print(padding_mask[:,:,:20,:])
-                #&"""
-            else:
-                attn_weights = attn_weights + causal_mask
-                
+            if key_states.shape[-2] != causal_mask.shape[-1]:
+                padding_mask =F.pad(causal_mask,( key_states.shape[-2] - causal_mask.shape[-1], 0))
+                causal_mask = padding_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and causal_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+        is_causal = True if causal_mask is None and q_len > 1 else False
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
         if q_len > 1:
             self.kv_cache_manager.log_time("attn_time", time() - st)
 
@@ -453,7 +454,7 @@ class LlamaAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, None , past_key_value
 
 
 class LlamaFlashAttention2(LlamaAttention):

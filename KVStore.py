@@ -40,7 +40,7 @@ class KVCacheManager:
         self.disk_path = disk_path
         self.hbm_capacity = hbm_capacity
         self.memory_capacity = memory_capacity
-        self.tokenizer = AutoTokenizer.from_pretrained("/mnt/sda1/Llama-3.1-8B")
+        self.tokenizer = AutoTokenizer.from_pretrained("/mnt/sda1/DeepSeek-R1-Distill-Llama-8B")
         self.mts_strategy = mts_strategy
         
         self.history_token_cnt = 0

@@ -51,13 +51,13 @@ def main():
                 "timestamp": timestamp,
                 "conversation": context,
             })
-
-        # 保证 history_prompt 的 tokenizer 长度小于 7500
-        full_history_prompt = ""
+        system_prompt = """ You will be given some conversations with the Timestamp, you need to remember it
+        and answer the question about these conversations. When it comes to time-related questions, provide
+        specific dates and time rather than vague answers like "yesterday", "last month", "this week" and so on.\n
+        """
+        full_history_prompt = system_prompt
         for session in sessions:
             temp_prompt = full_history_prompt + "\nTimestamp: " + session['timestamp'] + "\nConversation: " + session['conversation']
-            if len(tokenizer.encode(temp_prompt)) > 7500:
-                break
             full_history_prompt = temp_prompt
 
         qas = data["qa"]
@@ -67,11 +67,10 @@ def main():
 
             question = qa["question"]
             standard_answer = qa["answer"]
-            
             if i == 0:
-                prompt = full_history_prompt + "\nQuestion: " + question + "\nAnswer: "
+                prompt = full_history_prompt + "\nQuestion: " + question + "\nPlease answet the last question and do not repeat the answer above:"
             else:
-                prompt = "\nQuestion: " + question + "\nAnswer: "
+                prompt = "\nQuestion: " + question + "\nPlease answet the last question and do not repeat the answer above:"
             
             inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
             with torch.no_grad():
