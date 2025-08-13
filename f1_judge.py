@@ -22,8 +22,8 @@ def calculate_f1_score(gold_answer, generated_answer):
     generated_tokens = set(generated_answer.split())
     
     # 检查生成答案是否包含标准答案中的所有单词
-    if gold_tokens.issubset(generated_tokens):
-        return 1.0  # 如果包含所有单词，则认为完全正确
+    #if gold_tokens.issubset(generated_tokens):
+    #    return 1.0  # 如果包含所有单词，则认为完全正确
     
     # 如果不完全包含，则计算 F1 分数
     intersection = gold_tokens.intersection(generated_tokens)

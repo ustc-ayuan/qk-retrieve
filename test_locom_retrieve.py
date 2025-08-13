@@ -9,7 +9,7 @@ def main():
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model.")
     parser.add_argument("--block_size", type=int, required=True, help="Block size for the model.")
     parser.add_argument("--topk_threshold", type=float, required=True, help="Top-k threshold for the model.")
-    parser.add_argument("--mts_strategy", type=str, default="SUM", choices=["SUM", "RRF", "MAX"], help="MTS strategy.")
+    parser.add_argument("--mts_strategy", type=str, default="SUM", choices=["SUM", "RRF", "MAX", "SOFTMAX_SUM", "MEAN_POOL", "MAX_POOL","GUASSIAN"], help="MTS strategy.")
     parser.add_argument("--log_dir", type=str, default=None, help="Directory to save logs.")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save the results.")
     args = parser.parse_args()
@@ -68,9 +68,9 @@ def main():
             question = qa["question"]
             standard_answer = qa["answer"]
             if i == 0:
-                prompt = full_history_prompt + "\nQuestion: " + question + "\nPlease answet the last question and do not repeat the answer above:"
+                prompt = full_history_prompt + "\nQuestion: " + question + "\nPlease answet the last question and do not repeat the answer above:\nAnswer: "
             else:
-                prompt = "\nQuestion: " + question + "\nPlease answet the last question and do not repeat the answer above:"
+                prompt = "\nQuestion: " + question + "\nPlease answet the last question and do not repeat the answer above:\nAnswer: "
             
             inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
             with torch.no_grad():

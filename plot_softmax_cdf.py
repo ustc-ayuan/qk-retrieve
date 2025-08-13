@@ -94,7 +94,7 @@ def plot_softmax_cdf(pt_dir, cnt, layer, token_pos_str, head_pos_str):
 
     # Apply stable softmax
     if aggregated_scores.numel() > 0:
-        stable_scores = aggregated_scores - torch.max(aggregated_scores)
+        stable_scores = aggregated_scores / (torch.max(aggregated_scores, dim=-1, keepdim=True).values + 1e-9) * 7
         softmax_scores = torch.exp(stable_scores) / torch.sum(torch.exp(stable_scores))
     else:
         print(f"Warning: No scores selected for {pt_path}. Skipping plot.")

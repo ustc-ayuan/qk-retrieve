@@ -40,7 +40,7 @@ class KVCacheManager:
         self.disk_path = disk_path
         self.hbm_capacity = hbm_capacity
         self.memory_capacity = memory_capacity
-        self.tokenizer = AutoTokenizer.from_pretrained("/mnt/sda1/DeepSeek-R1-Distill-Llama-8B")
+        self.tokenizer = AutoTokenizer.from_pretrained("/mnt/sda1/Meta-Llama-3.1-8B-Instruct")
         self.mts_strategy = mts_strategy
         
         self.history_token_cnt = 0
@@ -227,6 +227,45 @@ class KVCacheManager:
         
     def related_score_eval(self, query: torch.Tensor, max_digest: torch.Tensor, min_digest: torch.Tensor,
                            layer_idx: int = 0, num_key_value_groups: int = 8) -> torch.Tensor:
+        if self.mts_strategy == "GUASSIAN":
+            # Step 1: Calculate initial detailed_scores to find pivot
+            _batch, _q_heads, _qlen, _h_dim = query.shape
+            _batch, _k_heads, _klen, _h_dim = max_digest.shape
+            _n_rep = _q_heads // _k_heads
+            _max_digest = max_digest[:, :, None, :, :].expand(_batch, _k_heads, _n_rep, _klen, _h_dim).reshape(_batch, _q_heads, _klen, _h_dim)
+            _min_digest = min_digest[:, :, None, :, :].expand(_batch, _k_heads, _n_rep, _klen, _h_dim).reshape(_batch, _q_heads, _klen, _h_dim)
+
+            _max_digest_expand = _max_digest.unsqueeze(2)
+            _min_digest_expand = _min_digest.unsqueeze(2)
+            _query_expand = query.unsqueeze(3)
+            _qmax = _query_expand * _max_digest_expand
+            _qmin = _query_expand * _min_digest_expand
+            initial_detailed_scores = torch.max(_qmax, _qmin).sum(dim=-1)
+
+            # Step 2: Find pivot query
+            query_scores = initial_detailed_scores.sum(dim=-1)
+            pivot_indices = query_scores.argmax(dim=-1, keepdim=True)
+            
+            pivot_indices_expanded = pivot_indices.unsqueeze(-1).expand(-1, -1, -1, query.shape[-1])
+            pivot_query = torch.gather(query, 2, pivot_indices_expanded)
+
+            # Step 3: Calculate weights and fuse using a more precise Gaussian kernel
+            sigma = 1.0  # Hyperparameter for Gaussian kernel bandwidth
+            distances_sq = torch.sum((query - pivot_query) ** 2, dim=-1)
+            weights = torch.exp(-distances_sq / (2 * sigma**2))
+            
+            # Normalize weights to ensure they sum to 1, adding epsilon for stability
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-9)
+
+            fused_query = torch.sum(query * weights.unsqueeze(-1), dim=2, keepdim=True)
+            
+            # Step 4: Overwrite query
+            query = fused_query
+        elif self.mts_strategy == "MEAN_POOL":
+            query = query.mean(dim=2, keepdim=True)
+        elif self.mts_strategy == "MAX_POOL":
+            query = query.max(dim=2, keepdim=True).values
+
         batch, q_num_key_value_heads, qlen, head_dim = query.shape
         batch, k_num_key_value_heads, klen, head_dim = max_digest.shape
         # GQA 适配
@@ -267,10 +306,15 @@ class KVCacheManager:
             related_score = detailed_scores.sum(dim=-2) # (bsz, head_num, k_len)
         elif self.mts_strategy == "MAX":
             related_score = detailed_scores.max(dim=-2).values # (bsz, head_num, k_len)
+        elif self.mts_strategy in ["MEAN_POOL", "MAX_POOL", "GUASSIAN"]:
+            related_score = detailed_scores.squeeze(dim=-2)
         else:
             raise ValueError(f"Unknown mts_strategy: {self.mts_strategy}")
         
         related_score = related_score.reshape(batch, k_num_key_value_heads, n_rep, klen)
         # 对每个组求和
         related_score = related_score.sum(dim=2)  # (bsz, q_num_key_value_heads, k_len)
-        return related_score.squeeze(0) # (head_num, k_len)
+        max_values = torch.max(related_score, dim=-1, keepdim=True).values
+        scaled_scores = related_score / (max_values + 1e-9) * 10
+        softmax_scores = torch.nn.functional.softmax(scaled_scores, dim=-1)
+        return softmax_scores.squeeze(0) # (head_num, k_len)
