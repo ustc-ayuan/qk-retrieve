@@ -199,24 +199,32 @@ def main():
         block_sizes = sorted(set(bs for bs, _ in all_keys))
         topk_values = sorted(set(tk for _, tk in all_keys))
 
-        metric_names = {
-            "F1": "F1", "B1": "BLEU-1", "RL": "ROUGE-L", "B2": "BLEU-2",
-            "Sim": "Cosine Sim"
-        }
-
-        for key, name in metric_names.items():
-            if key == "Sim" and not embedding_model:
+        # New printing logic for LaTeX format, incorporating user feedback
+        print(r"\textbf{Threshold} & \textbf{F1 Score} & \textbf{BLEU-1} & \textbf{BLEU-2} & \textbf{ROUGE-L}  & \textbf{Aver. Score}\\")
+        
+        for block_size in block_sizes:
+            # Check if there is any data for this block size to avoid printing empty sections
+            if not any(bs == block_size for bs, _ in all_keys):
                 continue
+
+            print(r"\midrule")
+            # The header has 6 columns, so multicolumn should span 6 columns.
+            print(f"\\multicolumn{{6}}{{c}}{{\\textbf{{Block {block_size}}}}} \\\\")
+            print(r"\midrule")
             
-            print(f"\n--- {name} Scores ---")
-            header = "Block Size / Topk\t" + "\t".join([f"Topk {topk}" for topk in topk_values])
-            print(header)
-            for block_size in block_sizes:
-                row = f"Block {block_size:<10}"
-                for topk in topk_values:
-                    score = accuracies[key].get((block_size, topk), 0)
-                    row += f"\t{score:<8.4f}"
-                print(row)
+            # Get the topk values that are actually present for this block_size
+            # to ensure we don't print rows for non-existent combinations.
+            block_specific_topks = sorted([tk for bs, tk in all_keys if bs == block_size])
+
+            for topk in block_specific_topks:
+                f1_score = accuracies["F1"].get((block_size, topk), 0) * 100
+                bleu1_score = accuracies["B1"].get((block_size, topk), 0) * 100
+                bleu2_score = accuracies["B2"].get((block_size, topk), 0) * 100
+                rouge_l_score = accuracies["RL"].get((block_size, topk), 0) * 100
+                
+                avg_score = (f1_score + bleu1_score + bleu2_score + rouge_l_score) / 4
+                
+                print(f"{topk} & {f1_score:.2f} & {bleu1_score:.2f} & {bleu2_score:.2f} & {rouge_l_score:.2f} & {avg_score:.2f} \\\\")
 
 if __name__ == "__main__":
     main()
