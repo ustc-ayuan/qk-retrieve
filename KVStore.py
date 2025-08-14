@@ -302,8 +302,33 @@ class KVCacheManager:
             k = 60  # RRF 参数，通常设置为 60
             rrf_scores = 1 / (k + ranks.float())  # (bsz, head_num, q_len, k_len)
             related_score = rrf_scores.sum(dim=-2)  # (bsz, head_num, k_len)
+            # RRF 不需要进行softmax归一            
+            related_score = related_score.reshape(batch, k_num_key_value_heads, n_rep, klen)
+            related_score = related_score.sum(dim=2)  # (bsz, q_num_key_value_heads, k_len)
+            return related_score.squeeze(0)
         elif self.mts_strategy == "SUM":
             related_score = detailed_scores.sum(dim=-2) # (bsz, head_num, k_len)
+        elif self.mts_strategy == "W_SUM":
+            # Find pivot query based on detailed_scores
+            query_scores = detailed_scores.sum(dim=-1) # sum over k_len
+            pivot_indices = query_scores.argmax(dim=-1, keepdim=True) # shape (bsz, head_num, 1)
+            
+            pivot_indices_expanded = pivot_indices.unsqueeze(-1).expand(-1, -1, -1, query.shape[-1]) # shape (bsz, head_num, 1, head_dim)
+            pivot_query = torch.gather(query, 2, pivot_indices_expanded) # shape (bsz, head_num, 1, head_dim)
+
+            # Calculate weights using Gaussian kernel
+            sigma = 1.0
+            distances_sq = torch.sum((query - pivot_query) ** 2, dim=-1) # query is (bsz, head_num, q_len, head_dim), pivot_query is (bsz, head_num, 1, head_dim). Broadcasting works.
+            weights = torch.exp(-distances_sq / (2 * sigma**2)) # shape (bsz, head_num, q_len)
+            
+            # Normalize weights
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-9) # shape (bsz, head_num, q_len)
+
+            # Apply weights to detailed_scores
+            weighted_detailed_scores = detailed_scores * weights.unsqueeze(-1)
+            
+            # Sum over q_len
+            related_score = weighted_detailed_scores.sum(dim=-2) # shape (bsz, head_num, k_len)
         elif self.mts_strategy == "MAX":
             related_score = detailed_scores.max(dim=-2).values # (bsz, head_num, k_len)
         elif self.mts_strategy in ["MEAN_POOL", "MAX_POOL", "GUASSIAN"]:
