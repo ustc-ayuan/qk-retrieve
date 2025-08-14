@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 import random
 
 from cache_utils import DynamicCache
-Digest = Tuple[torch.Tensor, torch.Tensor]
+Digest = Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]
 
 def create_cache_copy(existing_cache: DynamicCache) -> DynamicCache:
     # 创建一个新的 DynamicCache 实例
@@ -36,12 +36,14 @@ class KVCacheManager:
                  block_size: int = 64,
                  topk_threshold: float = 0.9,
                  mts_strategy: str = "SUM",
+                 digest_strategy: str = "bounding_cuboid",
                  log_dir: Optional[str] = None):
         self.disk_path = disk_path
         self.hbm_capacity = hbm_capacity
         self.memory_capacity = memory_capacity
         self.tokenizer = AutoTokenizer.from_pretrained("/mnt/sda1/Meta-Llama-3.1-8B-Instruct")
         self.mts_strategy = mts_strategy
+        self.digest_strategy = digest_strategy
         
         self.history_token_cnt = 0
         self.input_ids_list: List[List[int]] = []
@@ -105,23 +107,27 @@ class KVCacheManager:
     def save_digest_cache(self, token_ids: List[int], key_cache: List[torch.Tensor]):
         # (bsz, head_num, k_len, head_dim)
         key = self._generate_key(token_ids)
-        digest = []
+        digest_list = []
 
-        # Bounding-cuboid digest
-        for key_tensor in key_cache:
-            # Clone the key_tensor to ensure the original key_cache is not modified
-            key_tensor_clone = key_tensor.clone()
-            maxs = key_tensor_clone.max(dim=2).values
-            mins = key_tensor_clone.min(dim=2).values
-            centers = (maxs + mins) / 2
-            dists = (
-                (centers.unsqueeze(2) - key_tensor_clone).abs().mean(dim=2)
-            )
-            maxs = centers + dists
-            mins = centers - dists
-            digest.append((maxs, mins))
+        if self.digest_strategy == "bounding_cuboid":
+            # Bounding-cuboid digest
+            for key_tensor in key_cache:
+                # Clone the key_tensor to ensure the original key_cache is not modified
+                key_tensor_clone = key_tensor.clone()
+                maxs = key_tensor_clone.max(dim=2).values
+                mins = key_tensor_clone.min(dim=2).values
+                centers = (maxs + mins) / 2
+                dists = (
+                    (centers.unsqueeze(2) - key_tensor_clone).abs().mean(dim=2)
+                )
+                maxs = centers + dists
+                mins = centers - dists
+                digest_list.append((maxs, mins))
+        elif self.digest_strategy == "mean_digest":
+            for key_tensor in key_cache:
+                digest_list.append(key_tensor.mean(dim=2, keepdim=True))
 
-        self.memory_digest_cache[key] = digest
+        self.memory_digest_cache[key] = digest_list
 
     def log_time(self, event_type: str, duration: float):
         if event_type == "topk_time":
@@ -152,22 +158,39 @@ class KVCacheManager:
         if len(self.hash_key_list) == 0 or topk_threshold == 0:
             return torch.empty(0, 0, 0, 0, device=query_vector.device), torch.empty(0, 0, 0, 0, device=query_vector.device)
 
-        # TODO: 这里的tensor构建是十分低效的
-        max_digest_list = []
-        min_digest_list = []
-        for key in self.hash_key_list:
-            if len(self.memory_digest_cache[key]) > 0:
-                max_digest_list.append(self.memory_digest_cache[key][layer_idx][0])
-                min_digest_list.append(self.memory_digest_cache[key][layer_idx][1])
-        
-        if not max_digest_list:
-            return torch.empty(0, 0, 0, 0, device=query_vector.device), torch.empty(0, 0, 0, 0, device=query_vector.device)
+        if self.digest_strategy == "bounding_cuboid":
+            # TODO: 这里的tensor构建是十分低效的
+            max_digest_list = []
+            min_digest_list = []
+            for key in self.hash_key_list:
+                if len(self.memory_digest_cache[key]) > 0:
+                    digest = self.memory_digest_cache[key][layer_idx]
+                    max_digest_list.append(digest[0])
+                    min_digest_list.append(digest[1])
+            
+            if not max_digest_list:
+                return torch.empty(0, 0, 0, 0, device=query_vector.device), torch.empty(0, 0, 0, 0, device=query_vector.device)
 
-        max_digest = torch.stack(max_digest_list, dim=2).to(query_vector.device)
-        min_digest = torch.stack(min_digest_list, dim=2).to(query_vector.device)
-        
-        st = time()
-        scores = self.related_score_eval(query_vector, max_digest, min_digest, layer_idx, num_key_value_groups)
+            max_digest = torch.stack(max_digest_list, dim=2).to(query_vector.device)
+            min_digest = torch.stack(min_digest_list, dim=2).to(query_vector.device)
+            
+            st = time()
+            scores = self.related_score_eval(query_vector, max_digest, min_digest, layer_idx, num_key_value_groups)
+        elif self.digest_strategy == "mean_digest":
+            mean_digest_list = []
+            for key in self.hash_key_list:
+                if len(self.memory_digest_cache[key]) > 0:
+                    mean_digest_list.append(self.memory_digest_cache[key][layer_idx])
+            
+            if not mean_digest_list:
+                return torch.empty(0, 0, 0, 0, device=query_vector.device), torch.empty(0, 0, 0, 0, device=query_vector.device)
+            
+            mean_digest = torch.cat(mean_digest_list, dim=2).to(query_vector.device)
+            
+            st = time()
+            scores = self.related_score_eval(query_vector, mean_digest, None, layer_idx, num_key_value_groups)
+        else:
+            raise ValueError(f"Unknown digest strategy: {self.digest_strategy}")
         
         head_num, k_len = scores.shape
         scores_double = scores.to(torch.float64)
@@ -225,64 +248,47 @@ class KVCacheManager:
 
         return retrieve_k, retrieve_v
         
-    def related_score_eval(self, query: torch.Tensor, max_digest: torch.Tensor, min_digest: torch.Tensor,
+    def related_score_eval(self, query: torch.Tensor, max_digest: torch.Tensor, min_digest: Optional[torch.Tensor],
                            layer_idx: int = 0, num_key_value_groups: int = 8) -> torch.Tensor:
-        if self.mts_strategy == "GUASSIAN":
-            # Step 1: Calculate initial detailed_scores to find pivot
-            _batch, _q_heads, _qlen, _h_dim = query.shape
-            _batch, _k_heads, _klen, _h_dim = max_digest.shape
-            _n_rep = _q_heads // _k_heads
-            _max_digest = max_digest[:, :, None, :, :].expand(_batch, _k_heads, _n_rep, _klen, _h_dim).reshape(_batch, _q_heads, _klen, _h_dim)
-            _min_digest = min_digest[:, :, None, :, :].expand(_batch, _k_heads, _n_rep, _klen, _h_dim).reshape(_batch, _q_heads, _klen, _h_dim)
-
-            _max_digest_expand = _max_digest.unsqueeze(2)
-            _min_digest_expand = _min_digest.unsqueeze(2)
-            _query_expand = query.unsqueeze(3)
-            _qmax = _query_expand * _max_digest_expand
-            _qmin = _query_expand * _min_digest_expand
-            initial_detailed_scores = torch.max(_qmax, _qmin).sum(dim=-1)
-
-            # Step 2: Find pivot query
-            query_scores = initial_detailed_scores.sum(dim=-1)
-            pivot_indices = query_scores.argmax(dim=-1, keepdim=True)
-            
-            pivot_indices_expanded = pivot_indices.unsqueeze(-1).expand(-1, -1, -1, query.shape[-1])
-            pivot_query = torch.gather(query, 2, pivot_indices_expanded)
-
-            # Step 3: Calculate weights and fuse using a more precise Gaussian kernel
-            sigma = 1.0  # Hyperparameter for Gaussian kernel bandwidth
-            distances_sq = torch.sum((query - pivot_query) ** 2, dim=-1)
-            weights = torch.exp(-distances_sq / (2 * sigma**2))
-            
-            # Normalize weights to ensure they sum to 1, adding epsilon for stability
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-9)
-
-            fused_query = torch.sum(query * weights.unsqueeze(-1), dim=2, keepdim=True)
-            
-            # Step 4: Overwrite query
-            query = fused_query
-        elif self.mts_strategy == "MEAN_POOL":
+        if self.mts_strategy == "MEAN_POOL":
             query = query.mean(dim=2, keepdim=True)
         elif self.mts_strategy == "MAX_POOL":
             query = query.max(dim=2, keepdim=True).values
 
         batch, q_num_key_value_heads, qlen, head_dim = query.shape
         batch, k_num_key_value_heads, klen, head_dim = max_digest.shape
-        # GQA 适配
         n_rep = q_num_key_value_heads // k_num_key_value_heads
-        max_digest = max_digest[:, :, None, :, :].expand(batch, k_num_key_value_heads, n_rep, klen, head_dim)
-        max_digest = max_digest.reshape(batch, k_num_key_value_heads * n_rep, klen, head_dim)
-        min_digest = min_digest[:, :, None, :, :].expand(batch, k_num_key_value_heads, n_rep, klen, head_dim)
-        min_digest = min_digest.reshape(batch, k_num_key_value_heads * n_rep, klen, head_dim)
 
-        # 广播计算
-        max_digest_expand = max_digest.unsqueeze(2)
-        min_digest_expand = min_digest.unsqueeze(2)
-        query_expand = query.unsqueeze(3)
-        qmax = query_expand * max_digest_expand
-        qmin = query_expand * min_digest_expand  # (bsz, head_num, q_len, k_len, head_dim)
+        if self.digest_strategy == "bounding_cuboid":
+            # GQA 适配
+            max_digest = max_digest[:, :, None, :, :].expand(batch, k_num_key_value_heads, n_rep, klen, head_dim)
+            max_digest = max_digest.reshape(batch, k_num_key_value_heads * n_rep, klen, head_dim)
+            min_digest = min_digest[:, :, None, :, :].expand(batch, k_num_key_value_heads, n_rep, klen, head_dim)
+            min_digest = min_digest.reshape(batch, k_num_key_value_heads * n_rep, klen, head_dim)
 
-        detailed_scores = torch.max(qmax, qmin).sum(dim=-1) # (bsz, head_num, q_len, k_len)
+            # 广播计算
+            max_digest_expand = max_digest.unsqueeze(2)
+            min_digest_expand = min_digest.unsqueeze(2)
+            query_expand = query.unsqueeze(3)
+            qmax = query_expand * max_digest_expand
+            qmin = query_expand * min_digest_expand  # (bsz, head_num, q_len, k_len, head_dim)
+
+            inital_scores = torch.max(qmax, qmin).sum(dim=-1) # (bsz, head_num, q_len, k_len)
+            abs_inital_scores = torch.abs(inital_scores)
+            max_values = torch.max(abs_inital_scores, dim=-1, keepdim=True).values
+            scaled_scores = inital_scores / (max_values + 1e-9) * 10
+            detailed_scores = torch.nn.functional.softmax(scaled_scores, dim=-1)
+        elif self.digest_strategy == "mean_digest":
+            mean_digest = max_digest
+            mean_digest = mean_digest[:, :, None, :, :].expand(batch, k_num_key_value_heads, n_rep, klen, head_dim)
+            mean_digest = mean_digest.reshape(batch, k_num_key_value_heads * n_rep, klen, head_dim)
+            inital_scores = torch.matmul(query, mean_digest.transpose(-2, -1)) # (bsz, head_num, q_len, k_len)
+            abs_inital_scores = torch.abs(inital_scores)
+            max_values = torch.max(abs_inital_scores, dim=-1, keepdim=True).values
+            scaled_scores = inital_scores / (max_values + 1e-2) * 10
+            detailed_scores = torch.nn.functional.softmax(scaled_scores, dim=-1)
+        else:
+            raise ValueError(f"Unknown digest strategy: {self.digest_strategy}")
         #detailed_scores = torch.relu(detailed_scores)
         
         # 保存所有层的详细分数
@@ -292,7 +298,7 @@ class KVCacheManager:
     
         # 检查是否有 inf 或 NaN
         if torch.isinf(detailed_scores).any() or torch.isnan(detailed_scores).any():
-            print("scores contains inf or NaN")
+            print("scores contains inf or NaN",torch.isinf(detailed_scores).any())
             assert 1==2
 
         if self.mts_strategy == "RRF":
@@ -302,15 +308,11 @@ class KVCacheManager:
             k = 60  # RRF 参数，通常设置为 60
             rrf_scores = 1 / (k + ranks.float())  # (bsz, head_num, q_len, k_len)
             related_score = rrf_scores.sum(dim=-2)  # (bsz, head_num, k_len)
-            # RRF 不需要进行softmax归一            
-            related_score = related_score.reshape(batch, k_num_key_value_heads, n_rep, klen)
-            related_score = related_score.sum(dim=2)  # (bsz, q_num_key_value_heads, k_len)
-            return related_score.squeeze(0)
         elif self.mts_strategy == "SUM":
             related_score = detailed_scores.sum(dim=-2) # (bsz, head_num, k_len)
         elif self.mts_strategy == "W_SUM":
             # Find pivot query based on detailed_scores
-            query_scores = detailed_scores.sum(dim=-1) # sum over k_len
+            query_scores = inital_scores.sum(dim=-1) # sum over k_len
             pivot_indices = query_scores.argmax(dim=-1, keepdim=True) # shape (bsz, head_num, 1)
             
             pivot_indices_expanded = pivot_indices.unsqueeze(-1).expand(-1, -1, -1, query.shape[-1]) # shape (bsz, head_num, 1, head_dim)
@@ -331,15 +333,12 @@ class KVCacheManager:
             related_score = weighted_detailed_scores.sum(dim=-2) # shape (bsz, head_num, k_len)
         elif self.mts_strategy == "MAX":
             related_score = detailed_scores.max(dim=-2).values # (bsz, head_num, k_len)
-        elif self.mts_strategy in ["MEAN_POOL", "MAX_POOL", "GUASSIAN"]:
+        elif self.mts_strategy in ["MEAN_POOL", "MAX_POOL"]:
             related_score = detailed_scores.squeeze(dim=-2)
         else:
             raise ValueError(f"Unknown mts_strategy: {self.mts_strategy}")
         
+        # GQA适配对每个组求和
         related_score = related_score.reshape(batch, k_num_key_value_heads, n_rep, klen)
-        # 对每个组求和
         related_score = related_score.sum(dim=2)  # (bsz, q_num_key_value_heads, k_len)
-        max_values = torch.max(related_score, dim=-1, keepdim=True).values
-        scaled_scores = related_score / (max_values + 1e-9) * 10
-        softmax_scores = torch.nn.functional.softmax(scaled_scores, dim=-1)
-        return softmax_scores.squeeze(0) # (head_num, k_len)
+        return related_score.squeeze(0) # (head_num, k_len)

@@ -10,6 +10,7 @@ def main():
     parser.add_argument("--block_size", type=int, required=True, help="Block size for the model.")
     parser.add_argument("--topk_threshold", type=float, required=True, help="Top-k threshold for the model.")
     parser.add_argument("--mts_strategy", type=str, default="SUM", choices=["SUM", "RRF", "MAX", "SOFTMAX_SUM", "MEAN_POOL", "MAX_POOL","GUASSIAN", "W_SUM"], help="MTS strategy.")
+    parser.add_argument("--digest_strategy", type=str, default="mean_digest", choices=["bounding_cuboid", "mean_digest"], help="Digest strategy.")
     parser.add_argument("--log_dir", type=str, default=None, help="Directory to save logs.")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save the results.")
     args = parser.parse_args()
@@ -30,7 +31,8 @@ def main():
     for data in all_data:
         print("Starting new conversation...")
         # 每次对话重新加载模型
-        model = LlamaForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, block_size=block_size, topk_threshold=topk_threshold, mts_strategy=args.mts_strategy, log_dir=args.log_dir).cuda()
+        model = LlamaForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, block_size=block_size, topk_threshold=topk_threshold, 
+                            mts_strategy=args.mts_strategy, digest_strategy=args.digest_strategy, log_dir=args.log_dir).cuda()
         model.eval()
 
         # 提取 conversation 数据
@@ -100,7 +102,7 @@ def main():
             # Save results incrementally to prevent data loss from OOM
             with open(output_path, "w") as f:
                 json.dump(results, f, indent=4)
-
+        break
     # Final save is redundant if incremental saving is done, but kept for clarity
     with open(output_path, "w") as f:
         json.dump(results, f, indent=4)

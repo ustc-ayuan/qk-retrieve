@@ -903,15 +903,16 @@ class LlamaModel(LlamaPreTrainedModel):
         config: LlamaConfig
     """
 
-    def __init__(self, config: LlamaConfig, block_size: int = 64, topk_threshold: float = 0.9, mts_strategy: str = "SUM", log_dir: Optional[str] = None):
+    def __init__(self, config: LlamaConfig, block_size: int = 64, topk_threshold: float = 0.9, mts_strategy: str = "SUM", digest_strategy: str = "bounding_cuboid", log_dir: Optional[str] = None):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         # 新增缓存管理器
-        self.kv_cache_manager = KVCacheManager(block_size=block_size, topk_threshold=topk_threshold, mts_strategy=mts_strategy, log_dir=log_dir)
+        self.kv_cache_manager = KVCacheManager(block_size=block_size, topk_threshold=topk_threshold, mts_strategy=mts_strategy, digest_strategy=digest_strategy, log_dir=log_dir)
         self.block_size = block_size
         self.topk_threshold = topk_threshold
         self.mts_strategy = mts_strategy
+        self.digest_strategy = digest_strategy
         self._tail_tokens: List[int] = []
         self._tail_cache: Optional[DynamicCache] = DynamicCache()
         self.save_cnt = 0
@@ -919,7 +920,9 @@ class LlamaModel(LlamaPreTrainedModel):
         print("| block_size =  "+ str(self.block_size))
         print("| topk_threshold =  " + str(self.topk_threshold))
         print("| mts_strategy = " + str(self.mts_strategy))
+        print("| digest_strategy = " + str(self.digest_strategy))
         print("----------------------------------------")
+
         
         
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
@@ -1324,9 +1327,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
                  block_size: int = 64,
                  topk_threshold: float = 0.9,
                  mts_strategy: str = "SUM",
+                 digest_strategy: str = "bounding_cuboid",
                  log_dir: Optional[str] = None):
         super().__init__(config)
-        self.model = LlamaModel(config,block_size,topk_threshold, mts_strategy, log_dir)
+        self.model = LlamaModel(config,block_size,topk_threshold, mts_strategy, digest_strategy, log_dir)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
