@@ -9,6 +9,7 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge import Rouge
 from sentence_transformers import SentenceTransformer
 import torch
+from bert_score import score as bert_scorer
 
 # 定义 F1 分数计算函数
 def calculate_f1_score(gold_answer, generated_answer):
@@ -82,13 +83,13 @@ def clean_answer(answer):
     answer = re.sub(r'[^\w\s]', '', answer)
     return answer
 
-def process_file(file_path, embedding_model=None):
+def process_file(file_path, embedding_model=None, bert_model_path='microsoft/deberta-xlarge-mnli'):
     """Process a single file and calculate all specified scores."""
     with open(file_path, "r") as f:
         data = json.load(f)
 
     if not data:
-        return (0.0,) * 5 + (None,)
+        return (0.0,) * 6 + (None,)
 
     golds = [str(item["standard answer"]) for item in data]
     gens = [clean_answer(item["answer"]) for item in data]
@@ -99,6 +100,13 @@ def process_file(file_path, embedding_model=None):
     rouge_l_scores = [calculate_rouge_l_score(g, gen) for g, gen in zip(golds, gens)]
     bleu2_scores = [calculate_bleu2_score(g, gen) for g, gen in zip(golds, gens)]
     
+    # Batch calculation for BERTScore
+    bert_scores = []
+    if gens and golds:
+        # Using a default model, user can specify another model if needed
+        _, _, f1s = bert_scorer(gens, golds, lang="en", verbose=False, model_type=bert_model_path)
+        bert_scores = f1s.tolist()
+
     # Batch calculation for Cosine Similarity
     sim_scores = []
     if embedding_model:
@@ -115,6 +123,8 @@ def process_file(file_path, embedding_model=None):
         item["bleu1_score"] = bleu1_scores[i]
         item["rouge_l_score"] = rouge_l_scores[i]
         item["bleu2_score"] = bleu2_scores[i]
+        if bert_scores:
+            item["bert_score_f1"] = bert_scores[i]
         if sim_scores:
             item["cosine_similarity"] = sim_scores[i]
 
@@ -123,6 +133,7 @@ def process_file(file_path, embedding_model=None):
     avg_bleu1 = sum(bleu1_scores) / num_questions
     avg_rouge_l = sum(rouge_l_scores) / num_questions
     avg_bleu2 = sum(bleu2_scores) / num_questions
+    avg_bert_score = sum(bert_scores) / num_questions if bert_scores else 0.0
     avg_sim = sum(sim_scores) / num_questions if sim_scores else 0.0
 
     # --- Save judged file ---
@@ -131,7 +142,7 @@ def process_file(file_path, embedding_model=None):
     with open(judged_file_path, "w", encoding='utf-8') as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
-    return avg_f1, avg_bleu1, avg_rouge_l, avg_bleu2, avg_sim, judged_file_path
+    return avg_f1, avg_bleu1, avg_rouge_l, avg_bleu2, avg_sim, avg_bert_score, judged_file_path
 
 def main():
     """Main function to evaluate RAG results using multiple metrics."""
@@ -143,6 +154,10 @@ def main():
     parser.add_argument(
         "--is_file", action="store_true",
         help="Indicate if the input is a single file. If not provided, the input is treated as a folder.",
+    )
+    parser.add_argument(
+        "--bert_model_path", type=str, default='microsoft/deberta-xlarge-mnli',
+        help="Path to the local BERT model or huggingface model name for scoring."
     )
     args = parser.parse_args()
 
@@ -160,13 +175,14 @@ def main():
 
     if args.is_file:
         # Process a single file
-        scores = process_file(args.input, embedding_model)
-        (avg_f1, avg_b1, avg_rl, avg_b2, avg_sim, judged_file_path) = scores
+        scores = process_file(args.input, embedding_model, args.bert_model_path)
+        (avg_f1, avg_b1, avg_rl, avg_b2, avg_sim, avg_bert, judged_file_path) = scores
         print(f"\n--- Average Scores for {os.path.basename(args.input)} ---")
         print(f"F1 Score: {avg_f1:.4f}")
         print(f"BLEU-1 (B1): {avg_b1:.4f}")
         print(f"ROUGE-L (RL): {avg_rl:.4f}")
         print(f"BLEU-2 (B2): {avg_b2:.4f}")
+        print(f"BERTScore F1: {avg_bert:.4f}")
         if embedding_model:
             print(f"Cosine Similarity (Sim): {avg_sim:.4f}")
         print(f"\nJudged results saved to {judged_file_path}")
@@ -174,7 +190,7 @@ def main():
         # Process all files in the folder
         pattern = re.compile(r"output_block_(\d+)_topk_(\d+(\.\d+)?)\.txt")
         accuracies = {
-            "F1": {}, "B1": {}, "RL": {}, "B2": {}, "Sim": {}
+            "F1": {}, "B1": {}, "RL": {}, "B2": {}, "Sim": {}, "BERT": {}
         }
         files_to_process = [f for f in os.listdir(args.input) if pattern.match(f)]
         
@@ -183,13 +199,14 @@ def main():
             block_size = int(match.group(1))
             topk = float(match.group(2))
             file_path = os.path.join(args.input, file_name)
-            scores = process_file(file_path, embedding_model)
+            scores = process_file(file_path, embedding_model, args.bert_model_path)
             
             accuracies["F1"][(block_size, topk)] = scores[0]
             accuracies["B1"][(block_size, topk)] = scores[1]
             accuracies["RL"][(block_size, topk)] = scores[2]
             accuracies["B2"][(block_size, topk)] = scores[3]
             accuracies["Sim"][(block_size, topk)] = scores[4]
+            accuracies["BERT"][(block_size, topk)] = scores[5]
 
         if not accuracies["F1"]:
             print("No matching files found to process in the specified folder.")
@@ -200,7 +217,7 @@ def main():
         topk_values = sorted(set(tk for _, tk in all_keys))
 
         # New printing logic for LaTeX format, incorporating user feedback
-        print(r"\textbf{Threshold} & \textbf{F1 Score} & \textbf{BLEU-1} & \textbf{BLEU-2} & \textbf{ROUGE-L}  & \textbf{Aver. Score}\\")
+        print(r"\textbf{Threshold} & \textbf{F1 Score} & \textbf{BLEU-1} & \textbf{BLEU-2} & \textbf{ROUGE-L} & \textbf{BERTScore} & \textbf{Aver. Score}\\")
         
         for block_size in block_sizes:
             # Check if there is any data for this block size to avoid printing empty sections
@@ -208,8 +225,8 @@ def main():
                 continue
 
             print(r"\midrule")
-            # The header has 6 columns, so multicolumn should span 6 columns.
-            print(f"\\multicolumn{{6}}{{c}}{{\\textbf{{Block {block_size}}}}} \\\\")
+            # The header has 7 columns, so multicolumn should span 7 columns.
+            print(f"\\multicolumn{{7}}{{c}}{{\\textbf{{Block {block_size}}}}} \\\\")
             print(r"\midrule")
             
             # Get the topk values that are actually present for this block_size
@@ -221,10 +238,11 @@ def main():
                 bleu1_score = accuracies["B1"].get((block_size, topk), 0) * 100
                 bleu2_score = accuracies["B2"].get((block_size, topk), 0) * 100
                 rouge_l_score = accuracies["RL"].get((block_size, topk), 0) * 100
+                bert_score = accuracies["BERT"].get((block_size, topk), 0) * 100
                 
-                avg_score = (f1_score + bleu1_score + bleu2_score + rouge_l_score) / 4
+                avg_score = (f1_score + bleu1_score + bleu2_score + rouge_l_score + bert_score) / 5
                 
-                print(f"{topk} & {f1_score:.2f} & {bleu1_score:.2f} & {bleu2_score:.2f} & {rouge_l_score:.2f} & {avg_score:.2f} \\\\")
+                print(f"{topk} & {f1_score:.2f} & {bleu1_score:.2f} & {bleu2_score:.2f} & {rouge_l_score:.2f} & {bert_score:.2f} & {avg_score:.2f} \\\\")
 
 if __name__ == "__main__":
     main()
