@@ -9,7 +9,71 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge import Rouge
 from sentence_transformers import SentenceTransformer
 import torch
-from bert_score import score as bert_scorer
+from transformers import AutoModel, AutoTokenizer
+from torch.nn.functional import cosine_similarity
+import logging
+
+# 禁用transformers的warning
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+os.environ["TRANSFORMERS_CACHE"] = "/root/storage/models"
+os.environ["HF_HOME"] = "/root/storage/models"
+
+def calculate_bert_f1(gold_answers, generated_answers, model, tokenizer, device="cuda" if torch.cuda.is_available() else "cpu"):
+    """手动计算BERTScore F1，实现官方库的核心逻辑"""
+    model.eval()
+    all_f1 = []
+    
+    with torch.no_grad():
+        for ref, hyp in tqdm(zip(gold_answers, generated_answers), total=len(gold_answers), desc="Calculating BERTScore"):
+            if not ref or not hyp:
+                all_f1.append(0.0)
+                continue
+
+            # Tokenize输入
+            inputs_ref = tokenizer(ref, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+            inputs_hyp = tokenizer(hyp, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+            
+            # 获取词元级别的嵌入
+            outputs_ref = model(**inputs_ref)
+            outputs_hyp = model(**inputs_hyp)
+            
+            emb_ref = outputs_ref.last_hidden_state.squeeze(0)  # [seq_len_ref, hidden_size]
+            emb_hyp = outputs_hyp.last_hidden_state.squeeze(0)  # [seq_len_hyp, hidden_size]
+
+            # 移除 [CLS], [SEP] 和 padding tokens
+            mask_ref = inputs_ref['attention_mask'].squeeze(0).bool()
+            mask_hyp = inputs_hyp['attention_mask'].squeeze(0).bool()
+            
+            emb_ref = emb_ref[mask_ref][1:-1] # 忽略 [CLS] 和 [SEP]
+            emb_hyp = emb_hyp[mask_hyp][1:-1] # 忽略 [CLS] 和 [SEP]
+
+            if emb_ref.nelement() == 0 or emb_hyp.nelement() == 0:
+                all_f1.append(0.0)
+                continue
+
+            # 归一化嵌入
+            emb_ref = emb_ref / emb_ref.norm(dim=1, keepdim=True)
+            emb_hyp = emb_hyp / emb_hyp.norm(dim=1, keepdim=True)
+            
+            # 计算余弦相似度矩阵
+            sim_matrix = torch.matmul(emb_ref, emb_hyp.T)
+            
+            # 计算 Precision, Recall, F1
+            # Recall: 对于每个ref token，找到最相似的hyp token
+            recall_scores = sim_matrix.max(dim=1).values
+            R = recall_scores.mean()
+            
+            # Precision: 对于每个hyp token，找到最相似的ref token
+            precision_scores = sim_matrix.max(dim=0).values
+            P = precision_scores.mean()
+            
+            # F1 Score
+            F1 = 2 * P * R / (P + R) if (P + R) > 0 else 0.0
+            all_f1.append(F1.item())
+            
+    return all_f1
+
 
 # 定义 F1 分数计算函数
 def calculate_f1_score(gold_answer, generated_answer):
@@ -83,8 +147,8 @@ def clean_answer(answer):
     answer = re.sub(r'[^\w\s]', '', answer)
     return answer
 
-def process_file(file_path, embedding_model=None, bert_model_path='microsoft/deberta-xlarge-mnli'):
-    """Process a single file and calculate all specified scores."""
+def process_file(file_path, embedding_model=None, bert_model_path='bert-base-uncased'):
+    """处理文件并计算所有指标"""
     with open(file_path, "r") as f:
         data = json.load(f)
 
@@ -94,28 +158,31 @@ def process_file(file_path, embedding_model=None, bert_model_path='microsoft/deb
     golds = [str(item["standard answer"]) for item in data]
     gens = [clean_answer(item["answer"]) for item in data]
 
-    # --- Calculate all scores ---
+    # 加载BERT模型
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(bert_model_path)
+        model = AutoModel.from_pretrained(bert_model_path).to(device)
+        print("✓ BERT model loaded successfully")
+    except Exception as e:
+        print(f"× Failed to load BERT model: {e}")
+        return (0.0,) * 6 + (None,)
+
+    # 计算各项指标
+    bert_scores = calculate_bert_f1(golds, gens, model, tokenizer, device)
     f1_scores = [calculate_f1_score(g, gen) for g, gen in zip(golds, gens)]
     bleu1_scores = [calculate_bleu1_score(g, gen) for g, gen in zip(golds, gens)]
     rouge_l_scores = [calculate_rouge_l_score(g, gen) for g, gen in zip(golds, gens)]
     bleu2_scores = [calculate_bleu2_score(g, gen) for g, gen in zip(golds, gens)]
     
-    # Batch calculation for BERTScore
-    bert_scores = []
-    if gens and golds:
-        # Using a default model, user can specify another model if needed
-        _, _, f1s = bert_scorer(gens, golds, lang="en", verbose=False, model_type=bert_model_path)
-        bert_scores = f1s.tolist()
-
-    # Batch calculation for Cosine Similarity
+    # 计算余弦相似度
     sim_scores = []
     if embedding_model:
         gold_embeddings = embedding_model.encode(golds, convert_to_tensor=True, show_progress_bar=False)
         gen_embeddings = embedding_model.encode(gens, convert_to_tensor=True, show_progress_bar=False)
-        cosine_sim = torch.nn.functional.cosine_similarity(gen_embeddings, gold_embeddings)
-        sim_scores = cosine_sim.tolist()
+        sim_scores = cosine_similarity(gen_embeddings, gold_embeddings).tolist()
 
-    # --- Update data with scores and calculate averages ---
+    # 更新数据
     num_questions = len(data)
     for i, item in enumerate(data):
         item["answer"] = gens[i]
@@ -123,26 +190,25 @@ def process_file(file_path, embedding_model=None, bert_model_path='microsoft/deb
         item["bleu1_score"] = bleu1_scores[i]
         item["rouge_l_score"] = rouge_l_scores[i]
         item["bleu2_score"] = bleu2_scores[i]
-        if bert_scores:
-            item["bert_score_f1"] = bert_scores[i]
+        item["bert_score_f1"] = bert_scores[i]
         if sim_scores:
             item["cosine_similarity"] = sim_scores[i]
 
-    # --- Calculate average scores ---
+    # 计算平均分
     avg_f1 = sum(f1_scores) / num_questions
     avg_bleu1 = sum(bleu1_scores) / num_questions
     avg_rouge_l = sum(rouge_l_scores) / num_questions
     avg_bleu2 = sum(bleu2_scores) / num_questions
-    avg_bert_score = sum(bert_scores) / num_questions if bert_scores else 0.0
+    avg_bert = sum(bert_scores) / num_questions
     avg_sim = sum(sim_scores) / num_questions if sim_scores else 0.0
 
-    # --- Save judged file ---
+    # 保存结果
     judged_file_name = f"Judged_{os.path.basename(file_path)}"
     judged_file_path = os.path.join(os.path.dirname(file_path), judged_file_name)
     with open(judged_file_path, "w", encoding='utf-8') as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
-    return avg_f1, avg_bleu1, avg_rouge_l, avg_bleu2, avg_sim, avg_bert_score, judged_file_path
+    return avg_f1, avg_bleu1, avg_rouge_l, avg_bleu2, avg_sim, avg_bert, judged_file_path
 
 def main():
     """Main function to evaluate RAG results using multiple metrics."""
@@ -156,7 +222,7 @@ def main():
         help="Indicate if the input is a single file. If not provided, the input is treated as a folder.",
     )
     parser.add_argument(
-        "--bert_model_path", type=str, default='microsoft/deberta-xlarge-mnli',
+        "--bert_model_path", type=str, default='/root/storage/models/bert-base-uncased',
         help="Path to the local BERT model or huggingface model name for scoring."
     )
     args = parser.parse_args()
